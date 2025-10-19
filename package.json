@@ -1,0 +1,30 @@
+{
+  "name": "kadoo",
+  "private": "true",
+  "scripts": {
+    "dev:web": "next dev -w apps/web",
+    "build:web": "next build apps/web",
+    "start:web": "next start apps/web",
+    "dev:worker": "pnpm --filter kadoo-worker dev",
+    "build:worker": "pnpm --filter kadoo-worker build",
+    "start:worker": "pnpm --filter kadoo-worker start",
+    "dev": "turbo run dev --parallel",
+    "build": "turbo run build"
+  },
+  "devDependencies": {
+    "@types/node": "^24.8.1",
+    "eslint": "^9.37.0",
+    "prettier": "^3.6.2",
+    "tsx": "^4.20.6",
+    "turbo": "^2.5.8",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "bullmq": "^5.61.0",
+    "dotenv": "^17.2.3",
+    "ioredis": "^5.8.1",
+    "mongodb": "^6.20.0",
+    "openai": "^6.5.0",
+    "zod": "^4.1.12"
+  }
+}
