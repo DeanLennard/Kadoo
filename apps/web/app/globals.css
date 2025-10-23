@@ -1,26 +1,58 @@
 @import "tailwindcss";
 
+/* Kadoo design tokens */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+    --kadoo-blue: #2F6FED;   /* primary */
+    --kadoo-blue-600: #265bd1; /* hover ~8-12% darker */
+    --warm-yellow: #F6C945; /* accent */
+    --mint: #36D6B4;        /* success */
+    --charcoal: #1C1E21;    /* text */
+    --cloud: #F5F7FB;       /* background */
+    --card: #ffffff;
+    --muted: #667085;       /* subtle text */
+    --ring: rgba(47, 111, 237, 0.35);
+    --border: #E6EAF2;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+html, body {
+    height: 100%;
+    background: var(--cloud);
+    color: var(--charcoal);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+@layer components {
+    .k-btn {
+        @apply inline-flex items-center justify-center rounded-xl px-4 py-2 text-sm font-medium shadow-sm transition;
+    }
+    .k-btn-primary {
+        background: var(--kadoo-blue);
+        color: white;
+    }
+    .k-btn-primary:hover { background: var(--kadoo-blue-600); }
+    .k-btn-ghost {
+        @apply bg-transparent text-[var(--charcoal)];
+    }
+    .k-card {
+        @apply rounded-2xl bg-white shadow-sm border;
+        border-color: var(--border);
+    }
+    .k-badge {
+        @apply inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium;
+    }
+    .k-badge-mint {
+        background: color-mix(in oklab, var(--mint) 15%, white);
+        color: #095d4f;
+        border: 1px solid color-mix(in oklab, var(--mint) 35%, white);
+    }
+    .k-badge-warm {
+        background: color-mix(in oklab, var(--warm-yellow) 20%, white);
+        color: #5a4806;
+        border: 1px solid color-mix(in oklab, var(--warm-yellow) 40%, white);
+    }
+    .k-muted { color: var(--muted); }
+    .k-title { @apply text-xl font-semibold; }
+    .k-h1 { @apply text-2xl font-semibold; }
+    .k-h2 { @apply text-lg font-semibold; }
+    .k-divider { @apply h-px w-full; background: var(--border); }
+    .k-focus { box-shadow: 0 0 0 4px var(--ring); }
 }

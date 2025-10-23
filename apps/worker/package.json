@@ -8,5 +8,15 @@
     "dev": "tsx src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@kadoo/types": "workspace:*",
+    "date-fns": "^4.1.0",
+    "imapflow": "^1.0.200",
+    "nodemailer": "^7.0.9",
+    "openai": "^6.5.0"
+  },
+  "devDependencies": {
+    "@types/nodemailer": "^7.0.2"
   }
 }

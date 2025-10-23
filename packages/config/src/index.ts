@@ -3,7 +3,7 @@ import { z } from "zod";
 const Env = z.object({
     NODE_ENV: z.enum(["development","test","production"]).default("development"),
     MONGODB_URI: z.string().min(1),
-    MONGODB_DB: z.string().default("kadoo_dev"),
+    MONGODB_DB: z.string().default("kadoo"),
     REDIS_URL: z.string().min(1),
     OPENAI_API_KEY: z.string().min(1),
     // Web-only

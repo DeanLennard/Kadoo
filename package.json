@@ -1,6 +1,10 @@
 {
   "name": "kadoo",
   "private": "true",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
     "dev:web": "next dev -w apps/web",
     "build:web": "next build apps/web",
@@ -12,6 +16,7 @@
     "build": "turbo run build"
   },
   "devDependencies": {
+    "@types/mailparser": "^3.4.6",
     "@types/node": "^24.8.1",
     "eslint": "^9.37.0",
     "prettier": "^3.6.2",
@@ -21,10 +26,14 @@
   },
   "dependencies": {
     "bullmq": "^5.61.0",
+    "dompurify": "^3.3.0",
     "dotenv": "^17.2.3",
     "ioredis": "^5.8.1",
+    "jsdom": "^27.0.1",
+    "mailparser": "^3.7.5",
     "mongodb": "^6.20.0",
     "openai": "^6.5.0",
     "zod": "^4.1.12"
-  }
+  },
+  "packageManager": "pnpm@10.18.3+sha512.bbd16e6d7286fd7e01f6b3c0b3c932cda2965c06a908328f74663f10a9aea51f1129eea615134bf992831b009eabe167ecb7008b597f40ff9bc75946aadfb08d"
 }
