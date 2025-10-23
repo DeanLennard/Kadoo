@@ -7,6 +7,7 @@ import { classifyMessage } from "./workers/classify";
 import { decideAction } from "./workers/decide";
 import { generateDraft } from "./workers/generateDraft";
 import { ensureFullBody } from "./workers/ensureBody";
+import {resolveSpamMailbox} from "./util/resolveSpamMailbox";
 
 const LOCK_TTL_MS = 5 * 60 * 1000;
 
@@ -86,22 +87,31 @@ subscribe<IngestJob>(TOPIC_INGEST, async ({ tenantId, threadId, uid }) => {
     );
 
     // 2) apply label/move (server-side) if spam/newsletter etc.
-    if (facts.isSpam && settings.moveSpam) {
-        console.log(`[worker] spam.move.start`, { from: folder, to: "[Gmail]/Spam" });
+    const isSpam = Boolean(facts.isSpam) || (facts.labels || []).includes("spam");
+    if (isSpam && settings.moveSpam) {
+        console.log(`[worker] spam.move.start`, { from: folder, to: "Spam" });
         const conn = await connectors.findOne({ tenantId, type: "imap" });
         if (conn?.imap) {
             const client = await createImapClient(conn);
             try {
-                await client.mailboxOpen(folder);
-                const dest = "[Gmail]/Spam";
-                await client.messageMove(String(uid), dest, { uid: true } as any).catch(async () => {
+                const dest = await resolveSpamMailbox(client);
+                if (dest) {
+                    await client.messageMove(String(uid), dest, { uid: true } as any)
+                        .catch(async () => {
+                            await client.messageFlagsAdd(String(uid), ["\\Junk"], { uid: true } as any);
+                        });
+                    await messages.updateOne(
+                        { tenantId, threadId, uid },
+                        { $set: { folder: dest }, $addToSet: { labels: "spam" } }
+                    );
+                } else {
+                    // No mailbox found: flag only
                     await client.messageFlagsAdd(String(uid), ["\\Junk"], { uid: true } as any);
-                });
-                await messages.updateOne(
-                    { tenantId, threadId, uid },
-                    { $set: { folder: dest }, $addToSet: { labels: "spam" } }
-                );
-                await threads.updateOne({ _id: threadId, tenantId }, { $addToSet: { labels: "spam" } });
+                    await messages.updateOne(
+                        { tenantId, threadId, uid },
+                        { $addToSet: { labels: "spam" } }
+                    );
+                }
             } finally { try { await client.logout(); } catch {} }
             console.log(`[worker] spam.move.done`);
         }

@@ -2,7 +2,6 @@
 import { ImapFlow } from "imapflow";
 import { col } from "../db";
 import type { MailboxConnector, MailThread, MailMessage } from "@kadoo/types";
-import { decisionsQueue } from "../queues";
 import { getCursor, setCursor } from "./imapCursor";
 import { publish, TOPIC_INGEST } from "../queue";
 
@@ -49,6 +48,7 @@ export async function runImapIdle(connector: MailboxConnector, client: ImapFlow)
         const WINDOW = 200;
 
         const cursor = await getCursor(connector._id);
+        let lastUid = cursor?.lastUid ?? 0;
 
         let startSeq: number;
         if (!cursor || cursor.uidValidity !== uidValidity || !cursor.lastUid) {
@@ -72,6 +72,7 @@ export async function runImapIdle(connector: MailboxConnector, client: ImapFlow)
             const msg = it;
 
             if (!msg.uid) continue;
+            if (typeof msg.uid !== "number") continue;
 
             const date     = msg.envelope?.date ?? new Date();
             const subject  = msg.envelope?.subject ?? "(no subject)";
@@ -80,61 +81,64 @@ export async function runImapIdle(connector: MailboxConnector, client: ImapFlow)
             const messageId = msg.envelope?.messageId ?? String(msg.uid);
             const threadId  = `${connector._id}:${messageId}`;
 
-            await threadsCol.updateOne(
-                { _id: threadId },
-                {
-                    $setOnInsert: {
-                        _id: threadId,
-                        tenantId: connector.tenantId,
-                        connectorId: connector._id,
-                        subject,
-                        participants: [from, ...to],
-                        status: "awaiting_us",
-                        facts: [],
-                        lastMessageIds: [],
-                        createdAt: date,
-                        folder: "INBOX",
+                await threadsCol.updateOne(
+                    { _id: threadId },
+                    {
+                        $setOnInsert: {
+                            _id: threadId,
+                            tenantId: connector.tenantId,
+                            connectorId: connector._id,
+                            subject,
+                            participants: [from, ...to],
+                            status: "awaiting_us",
+                            facts: [],
+                            lastMessageIds: [],
+                            createdAt: date,
+                            folder: "INBOX",
+                        },
+                        $set: { lastTs: date },
+                        $inc: { unread: 1 },
                     },
-                    $set: { lastTs: date },
-                    $inc: { unread: 1 },
-                },
-                { upsert: true }
-            );
+                    { upsert: true }
+                );
 
-            // ✅ Keep uid:true only on download()
-            const dl = await (client as any)
-                .download(String(msg.uid), { uid: true })
-                .catch(() => null as any);
-            const text = toUtf8Snippet(dl?.content);
+                // ✅ Keep uid:true only on download()
+                const dl = await (client as any)
+                    .download(String(msg.uid), { uid: true })
+                    .catch(() => null as any);
+                const text = toUtf8Snippet(dl?.content);
 
-            await messagesCol.updateOne(
-                { _id: `${threadId}:${msg.uid}` },
-                {
-                    $set: {
-                        _id: `${threadId}:${msg.uid}`,
-                        tenantId: connector.tenantId,
-                        threadId,
-                        msgId: messageId,
-                        uid: msg.uid,
-                        uidValidity,
-                        from,
-                        to,
-                        cc: [],
-                        date,
-                        text,
-                        folder: "INBOX",
+                await messagesCol.updateOne(
+                    { _id: `${threadId}:${msg.uid}` },
+                    {
+                        $set: {
+                            _id: `${threadId}:${msg.uid}`,
+                            tenantId: connector.tenantId,
+                            threadId,
+                            msgId: messageId,
+                            uid: msg.uid,
+                            uidValidity,
+                            from,
+                            to,
+                            cc: [],
+                            date,
+                            text,
+                            folder: "INBOX",
+                        },
                     },
-                },
-                { upsert: true }
-            );
+                    { upsert: true }
+                );
 
-            await setCursor(connector._id, connector.tenantId, { uidValidity, lastUid: msg.uid });
+            if (msg.uid > lastUid) {
+                // publish only new UIDs
+                await publish(TOPIC_INGEST, { tenantId: connector.tenantId, threadId, uid: msg.uid }, {
+                    jobId: `${connector.tenantId}:${threadId}:${msg.uid}`
+                });
+                // advance lastUid *after* successful DB write/publish
+                lastUid = msg.uid;
+                await setCursor(connector._id, connector.tenantId, { uidValidity, lastUid });
+            } else {
 
-            try {
-                await publish(TOPIC_INGEST, { tenantId: connector.tenantId, threadId, uid: msg.uid });
-                console.log(`[imapIdle] queued ingest`, { threadId, uid: msg.uid });
-            } catch (err) {
-                console.error(`[imapIdle] publish failed`, err);
             }
         }
     }
@@ -142,6 +146,9 @@ export async function runImapIdle(connector: MailboxConnector, client: ImapFlow)
     async function onExists() {
         const mb = client.mailbox;
         if (!mb) return;
+
+        const cur = await getCursor(connector._id);
+        let lastUid = cur?.lastUid ?? 0;
 
         const latestSeq = mb.exists;
         if (!latestSeq || typeof latestSeq !== "number") return;
@@ -152,6 +159,7 @@ export async function runImapIdle(connector: MailboxConnector, client: ImapFlow)
             if (it === false) return;
             const m = it as any;
             if (!m.uid) return;
+            if (m.uid <= lastUid) return;
 
             const date      = m.envelope?.date ?? new Date();
             const subject   = m.envelope?.subject ?? "(no subject)";
@@ -203,23 +211,15 @@ export async function runImapIdle(connector: MailboxConnector, client: ImapFlow)
                 { upsert: true }
             );
 
-            await setCursor(connector._id, connector.tenantId, {
-                uidValidity: Number(mb.uidValidity),
-                lastUid: m.uid,
-            });
-
             try {
-                await publish(TOPIC_INGEST, { tenantId: connector.tenantId, threadId, uid: m.uid });
+                await publish(TOPIC_INGEST, { tenantId: connector.tenantId, threadId, uid: m.uid }, {
+                    jobId: `${connector.tenantId}:${threadId}:${m.uid}`
+                });
+                await setCursor(connector._id, connector.tenantId, { uidValidity: Number(mb.uidValidity), lastUid: m.uid });
                 console.log(`[imapIdle] queued ingest`, { threadId, uid: m.uid });
             } catch (err) {
                 console.error(`[imapIdle] publish failed`, err);
             }
-
-            await decisionsQueue.add(
-                "newMail",
-                { tenantId: connector.tenantId, threadId },
-                { removeOnComplete: true, attempts: 3, backoff: { type: "exponential", delay: 1500 } }
-            );
         } finally {
             lock.release();
         }
