@@ -89,32 +89,55 @@ subscribe<IngestJob>(TOPIC_INGEST, async ({ tenantId, threadId, uid }) => {
     // 2) apply label/move (server-side) if spam/newsletter etc.
     const isSpam = Boolean(facts.isSpam) || (facts.labels || []).includes("spam");
     if (isSpam && settings.moveSpam) {
-        console.log(`[worker] spam.move.start`, { from: folder, to: "Spam" });
+        const source = (msg as any).folder || "INBOX";
+        console.log(`[worker] spam.move.start`, { from: source });
+
         const conn = await connectors.findOne({ tenantId, type: "imap" });
         if (conn?.imap) {
             const client = await createImapClient(conn);
             try {
-                const dest = await resolveSpamMailbox(client);
+                // MUST open source folder to use UID-based ops
+                await client.mailboxOpen(source);
+
+                const dest = await resolveSpamMailbox(client); // e.g. "[Gmail]/Spam", "Junk", etc.
+                console.log(`[worker] spam.resolve`, { dest: dest || "(none)" });
+
                 if (dest) {
-                    await client.messageMove(String(uid), dest, { uid: true } as any)
-                        .catch(async () => {
-                            await client.messageFlagsAdd(String(uid), ["\\Junk"], { uid: true } as any);
-                        });
-                    await messages.updateOne(
-                        { tenantId, threadId, uid },
-                        { $set: { folder: dest }, $addToSet: { labels: "spam" } }
-                    );
+                    try {
+                        await client.messageMove(String(uid), dest, { uid: true } as any);
+                        // Reflect move in DB
+                        await messages.updateOne(
+                            { tenantId, threadId, uid },
+                            { $set: { folder: dest }, $addToSet: { labels: "spam" } }
+                        );
+                        await threads.updateOne(
+                            { _id: threadId, tenantId },
+                            { $set: { folder: dest }, $addToSet: { labels: "spam" } }
+                        );
+                        console.log(`[worker] spam.move.ok`, { uid, dest });
+                    } catch (e) {
+                        console.warn(`[worker] spam.move.failed, flagging as \\Junk`, e);
+                        await client.messageFlagsAdd(String(uid), ["\\Junk"], { uid: true } as any);
+                        await messages.updateOne(
+                            { tenantId, threadId, uid },
+                            { $addToSet: { labels: "spam" } }
+                        );
+                        // keep folder as-is if we didn’t actually move
+                    }
                 } else {
-                    // No mailbox found: flag only
+                    console.warn(`[worker] no spam mailbox found, flagging as \\Junk`);
                     await client.messageFlagsAdd(String(uid), ["\\Junk"], { uid: true } as any);
                     await messages.updateOne(
                         { tenantId, threadId, uid },
                         { $addToSet: { labels: "spam" } }
                     );
                 }
-            } finally { try { await client.logout(); } catch {} }
-            console.log(`[worker] spam.move.done`);
+            } finally {
+                try { await client.logout(); } catch {}
+            }
         }
+
+        console.log(`[worker] spam.move.done`);
         return;
     }
 

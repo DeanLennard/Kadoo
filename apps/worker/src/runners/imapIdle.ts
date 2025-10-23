@@ -49,6 +49,7 @@ export async function runImapIdle(connector: MailboxConnector, client: ImapFlow)
 
         const cursor = await getCursor(connector._id);
         let lastUid = cursor?.lastUid ?? 0;
+        let maxSeenUid = lastUid;
 
         let startSeq: number;
         if (!cursor || cursor.uidValidity !== uidValidity || !cursor.lastUid) {
@@ -71,8 +72,7 @@ export async function runImapIdle(connector: MailboxConnector, client: ImapFlow)
         for await (const it of client.fetch(`${startSeq}:${endSeq}`, { envelope: true })) {
             const msg = it;
 
-            if (!msg.uid) continue;
-            if (typeof msg.uid !== "number") continue;
+            if (!msg?.uid || typeof msg.uid !== "number") continue;
 
             const date     = msg.envelope?.date ?? new Date();
             const subject  = msg.envelope?.subject ?? "(no subject)";
@@ -81,65 +81,66 @@ export async function runImapIdle(connector: MailboxConnector, client: ImapFlow)
             const messageId = msg.envelope?.messageId ?? String(msg.uid);
             const threadId  = `${connector._id}:${messageId}`;
 
-                await threadsCol.updateOne(
-                    { _id: threadId },
-                    {
-                        $setOnInsert: {
-                            _id: threadId,
-                            tenantId: connector.tenantId,
-                            connectorId: connector._id,
-                            subject,
-                            participants: [from, ...to],
-                            status: "awaiting_us",
-                            facts: [],
-                            lastMessageIds: [],
-                            createdAt: date,
-                            folder: "INBOX",
-                        },
-                        $set: { lastTs: date },
-                        $inc: { unread: 1 },
+            await threadsCol.updateOne(
+                { _id: threadId },
+                {
+                    $setOnInsert: {
+                        _id: threadId,
+                        tenantId: connector.tenantId,
+                        connectorId: connector._id,
+                        subject,
+                        participants: [from, ...to],
+                        status: "awaiting_us",
+                        facts: [],
+                        lastMessageIds: [],
+                        createdAt: date,
+                        folder: "INBOX",
                     },
-                    { upsert: true }
-                );
+                    $set: { lastTs: date },
+                    $inc: { unread: 1 },
+                },
+                { upsert: true }
+            );
 
-                // ✅ Keep uid:true only on download()
-                const dl = await (client as any)
-                    .download(String(msg.uid), { uid: true })
-                    .catch(() => null as any);
-                const text = toUtf8Snippet(dl?.content);
+            // ✅ Keep uid:true only on download()
+            const dl = await (client as any)
+                .download(String(msg.uid), { uid: true })
+                .catch(() => null as any);
+            const text = toUtf8Snippet(dl?.content);
 
-                await messagesCol.updateOne(
-                    { _id: `${threadId}:${msg.uid}` },
-                    {
-                        $set: {
-                            _id: `${threadId}:${msg.uid}`,
-                            tenantId: connector.tenantId,
-                            threadId,
-                            msgId: messageId,
-                            uid: msg.uid,
-                            uidValidity,
-                            from,
-                            to,
-                            cc: [],
-                            date,
-                            text,
-                            folder: "INBOX",
-                        },
+            await messagesCol.updateOne(
+                { _id: `${threadId}:${msg.uid}` },
+                {
+                    $set: {
+                        _id: `${threadId}:${msg.uid}`,
+                        tenantId: connector.tenantId,
+                        threadId,
+                        msgId: messageId,
+                        uid: msg.uid,
+                        uidValidity,
+                        from,
+                        to,
+                        cc: [],
+                        date,
+                        text,
+                        folder: "INBOX",
                     },
-                    { upsert: true }
-                );
+                },
+                { upsert: true }
+            );
 
             if (msg.uid > lastUid) {
-                // publish only new UIDs
-                await publish(TOPIC_INGEST, { tenantId: connector.tenantId, threadId, uid: msg.uid }, {
-                    jobId: `${connector.tenantId}:${threadId}:${msg.uid}`
-                });
-                // advance lastUid *after* successful DB write/publish
-                lastUid = msg.uid;
-                await setCursor(connector._id, connector.tenantId, { uidValidity, lastUid });
+                console.log(`[imapIdle] publish uid=${msg.uid} (lastUid=${lastUid}) threadId=${threadId}`);
+                await publish(TOPIC_INGEST, { tenantId: connector.tenantId, threadId, uid: msg.uid });
+                if (msg.uid > maxSeenUid) maxSeenUid = msg.uid;
             } else {
-
+                console.log(`[imapIdle] skip uid=${msg.uid} (<= lastUid=${lastUid})`);
             }
+        }
+
+        if (maxSeenUid > lastUid) {
+            await setCursor(connector._id, connector.tenantId, { uidValidity, lastUid: maxSeenUid });
+            console.log(`[imapIdle] cursor advanced to ${maxSeenUid}`);
         }
     }
 
