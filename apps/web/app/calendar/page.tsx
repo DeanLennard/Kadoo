@@ -1,10 +1,31 @@
-// apps/web/app/(app)/calendar/page.tsx
 "use client";
 import useSWR from "swr";
 
 type Event = { start: string; end: string; summary?: string };
-
 const fetcher = (u: string) => fetch(u).then(r => r.json());
+
+// deterministic formatters (always en-GB, Europe/London)
+const dayFmt = new Intl.DateTimeFormat("en-GB", {
+    weekday: "short",
+    day: "2-digit",
+    month: "short",
+    timeZone: "Europe/London",
+});
+const timeFmt = new Intl.DateTimeFormat("en-GB", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZone: "Europe/London",
+});
+
+function dayLabel(d: Date) {
+    const parts = Object.fromEntries(dayFmt.formatToParts(d).map(p => [p.type, p.value]));
+    // Assemble ourselves to avoid locale “literal” commas
+    return `${parts.weekday} ${parts.day} ${parts.month}`;
+}
+function timeHM(s: string) {
+    return timeFmt.format(new Date(s));
+}
 
 export default function CalendarPage() {
     const { data } = useSWR<{ events: Event[] }>("/api/calendar/events?days=14", fetcher);
@@ -16,7 +37,7 @@ export default function CalendarPage() {
             <div className="k-muted">Next 14 days (busy blocks)</div>
             <div className="grid grid-cols-7 gap-2">
                 {Array.from({ length: 14 }).map((_, i) => (
-                    <Day key={i} offsetDays={i} events={events}/>
+                    <Day key={i} offsetDays={i} events={events} />
                 ))}
             </div>
         </main>
@@ -24,9 +45,11 @@ export default function CalendarPage() {
 }
 
 function Day({ offsetDays, events }: { offsetDays: number; events: Event[] }) {
-    const dayStart = new Date(); dayStart.setHours(0,0,0,0);
+    const dayStart = new Date();
+    dayStart.setHours(0, 0, 0, 0);
     dayStart.setDate(dayStart.getDate() + offsetDays);
-    const dayEnd = new Date(dayStart.getTime() + 24*3600*1000);
+
+    const dayEnd = new Date(dayStart.getTime() + 24 * 3600 * 1000);
 
     const busy = events.filter(e => {
         const s = new Date(e.start).getTime();
@@ -37,7 +60,8 @@ function Day({ offsetDays, events }: { offsetDays: number; events: Event[] }) {
     return (
         <div className="border rounded p-2 min-h-48">
             <div className="k-title mb-2">
-                {dayStart.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" })}
+                {/* Optional extra guard: suppressHydrationWarning */}
+                <span suppressHydrationWarning>{dayLabel(dayStart)}</span>
             </div>
             <div className="space-y-2">
                 {busy.length === 0 && <div className="text-xs k-muted">Free</div>}
@@ -49,9 +73,4 @@ function Day({ offsetDays, events }: { offsetDays: number; events: Event[] }) {
             </div>
         </div>
     );
-}
-
-function timeHM(s: string) {
-    const d = new Date(s);
-    return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 }
