@@ -113,7 +113,7 @@ subscribe<IngestJob>(TOPIC_INGEST, async ({ tenantId, threadId, uid }) => {
                         );
                         await threads.updateOne(
                             { _id: threadId, tenantId },
-                            { $set: { folder: dest }, $addToSet: { labels: "spam" } }
+                            { $set: { folder: dest, lastUid: uid }, $addToSet: { labels: "spam" } }
                         );
                         console.log(`[worker] spam.move.ok`, { uid, dest });
                     } catch (e) {

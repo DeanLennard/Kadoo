@@ -44,43 +44,39 @@ export async function runImapIdle(connector: MailboxConnector, client: ImapFlow)
         if (!mb) return;
 
         const uidValidity = Number(mb.uidValidity);
-        const total = typeof mb.exists === "number" ? mb.exists : 0;
-        const WINDOW = 200;
-
         const cursor = await getCursor(connector._id);
-        let lastUid = cursor?.lastUid ?? 0;
-        let maxSeenUid = lastUid;
+        const lastUid = cursor?.lastUid ?? 0;
 
-        let startSeq: number;
-        if (!cursor || cursor.uidValidity !== uidValidity || !cursor.lastUid) {
-            startSeq = Math.max(1, total - WINDOW + 1);
-        } else {
-            startSeq = Math.max(1, total - WINDOW + 1);
-        }
+        // last 14 days
+        const since = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
 
-        if (total === 0 || startSeq > total) {
-            await setCursor(connector._id, connector.tenantId, {
-                uidValidity,
-                lastUid: cursor?.lastUid ?? 0,
-            });
+        // 1) Search returns sequence numbers by default. Ask for UIDs:
+        const uids = await client.search({ since }, { uid: true }) as number[]; // imapflow returns number[]
+
+        if (!uids || uids.length === 0) {
+            await setCursor(connector._id, connector.tenantId, { uidValidity, lastUid });
             return;
         }
 
-        const endSeq = total;
+        // Only process UIDs above the saved cursor
+        const newUids = uids.filter((u) => u > lastUid).sort((a, b) => a - b);
+        if (newUids.length === 0) return;
 
-        // ✅ Remove uid:true here
-        for await (const it of client.fetch(`${startSeq}:${endSeq}`, { envelope: true })) {
-            const msg = it;
+        let maxSeenUid = lastUid;
 
+        // 2) Fetch by UID list; request envelope + uid
+        for await (const it of client.fetch(newUids, { envelope: true, uid: true })) {
+            const msg = it as any;
             if (!msg?.uid || typeof msg.uid !== "number") continue;
 
-            const date     = msg.envelope?.date ?? new Date();
-            const subject  = msg.envelope?.subject ?? "(no subject)";
-            const from     = msg.envelope?.from?.[0]?.address ?? "";
-            const to       = (msg.envelope?.to ?? []).map((a: any) => a.address!).filter(Boolean);
+            const date      = msg.envelope?.date ?? new Date();
+            const subject   = msg.envelope?.subject ?? "(no subject)";
+            const from      = msg.envelope?.from?.[0]?.address ?? "";
+            const to        = (msg.envelope?.to ?? []).map((a: any) => a.address!).filter(Boolean);
             const messageId = msg.envelope?.messageId ?? String(msg.uid);
             const threadId  = `${connector._id}:${messageId}`;
 
+            // Upsert thread (with lastUid/lastMsgId)
             await threadsCol.updateOne(
                 { _id: threadId },
                 {
@@ -96,16 +92,15 @@ export async function runImapIdle(connector: MailboxConnector, client: ImapFlow)
                         createdAt: date,
                         folder: "INBOX",
                     },
-                    $set: { lastTs: date },
+                    $set: { lastTs: date, lastUid: msg.uid, lastMsgId: messageId, folder: "INBOX" },
+                    $addToSet: { messageUids: msg.uid },
                     $inc: { unread: 1 },
                 },
                 { upsert: true }
             );
 
-            // ✅ Keep uid:true only on download()
-            const dl = await (client as any)
-                .download(String(msg.uid), { uid: true })
-                .catch(() => null as any);
+            // Optional small snippet (don’t pull full body here)
+            const dl = await (client as any).download(String(msg.uid), { uid: true }).catch(() => null as any);
             const text = toUtf8Snippet(dl?.content);
 
             await messagesCol.updateOne(
@@ -129,18 +124,13 @@ export async function runImapIdle(connector: MailboxConnector, client: ImapFlow)
                 { upsert: true }
             );
 
-            if (msg.uid > lastUid) {
-                console.log(`[imapIdle] publish uid=${msg.uid} (lastUid=${lastUid}) threadId=${threadId}`);
-                await publish(TOPIC_INGEST, { tenantId: connector.tenantId, threadId, uid: msg.uid });
-                if (msg.uid > maxSeenUid) maxSeenUid = msg.uid;
-            } else {
-                console.log(`[imapIdle] skip uid=${msg.uid} (<= lastUid=${lastUid})`);
-            }
+            // Publish for worker to classify/move/fetch-full-body
+            await publish(TOPIC_INGEST, { tenantId: connector.tenantId, threadId, uid: msg.uid });
+            if (msg.uid > maxSeenUid) maxSeenUid = msg.uid;
         }
 
         if (maxSeenUid > lastUid) {
             await setCursor(connector._id, connector.tenantId, { uidValidity, lastUid: maxSeenUid });
-            console.log(`[imapIdle] cursor advanced to ${maxSeenUid}`);
         }
     }
 
