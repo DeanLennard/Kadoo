@@ -46,7 +46,7 @@ export async function appendImapDraft(args: {
     const inReplyTo = parentMsgId;
     const references = parentMsgId ? [parentMsgId] : [];
 
-    const rfc822 = buildRfc822({
+    const rfc822Raw = buildRfc822({
         from: fromDisplay,
         to,
         subject,
@@ -56,8 +56,11 @@ export async function appendImapDraft(args: {
         references,
     });
 
-    const payload: string =
-        typeof rfc822 === "string" ? rfc822 : Buffer.from(rfc822).toString("utf8");
+    // Force string + CRLF
+    const payload: string = (typeof rfc822Raw === "string"
+            ? rfc822Raw
+            : Buffer.from(rfc822Raw).toString("utf8")
+    ).replace(/\r?\n/g, "\r\n");
 
     const client = await createImapClient(conn);
     try {
@@ -69,11 +72,9 @@ export async function appendImapDraft(args: {
             await client.mailboxOpen(mailbox);
         });
 
-        // rfc822 is a string per your buildRfc822()
-        const res = await (client as any).append(
-            payload,
-            { flags: ["\\Draft"] } as AppendOptionsLite
-        );
+        console.log("append args types", { mailbox: typeof mailbox, payload: typeof payload });
+        const res = await client.append(mailbox, payload, ["\\Draft"]);
+
         const resUid = res && typeof res === "object" ? (res as any).uid ?? null : null;
 
         const draftsCol = await col<Draft>("Draft");

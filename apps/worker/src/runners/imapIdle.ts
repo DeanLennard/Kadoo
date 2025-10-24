@@ -65,7 +65,7 @@ export async function runImapIdle(connector: MailboxConnector, client: ImapFlow)
         let maxSeenUid = lastUid;
 
         // 2) Fetch by UID list; request envelope + uid
-        for await (const it of client.fetch(newUids, { envelope: true, uid: true })) {
+        for await (const it of client.fetch(newUids, { envelope: true }, { uid: true })) {
             const msg = it as any;
             if (!msg?.uid || typeof msg.uid !== "number") continue;
 
