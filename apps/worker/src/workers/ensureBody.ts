@@ -48,10 +48,23 @@ export async function ensureFullBody({ tenantId, threadId, uid, force }: EnsureA
     if (!conn?.imap) return doc;
 
     const client = await createImapClient(conn);
+
     try {
         // Try the folder we think it's in; if that fails, we'll search by Message-ID
-        const folder = (doc as any).folder || "INBOX";
-        await client.mailboxOpen(folder, { readOnly: true }).catch(() => { /* will try fallback */ });
+        const openOne = async (paths: string[]) => {
+            for (const p of paths) {
+                try { await client.mailboxOpen(p, { readOnly: true }); return p; } catch {}
+            }
+            return null;
+        };
+
+        const recordedFolder = (doc as any).folder || "INBOX";
+        let opened = await openOne([recordedFolder]);
+        if (!opened) {
+            // try a few common ones
+            opened = await openOne(["INBOX", "[Gmail]/Spam", "Spam", "Junk", "INBOX.Junk"]);
+        }
+        if (!opened) return doc; // nowhere to search
 
         // Prefer fetching both SOURCE and BODYSTRUCTURE so we can also persist attachments metadata
         let sourceBuf: Buffer | null = null;
@@ -62,7 +75,6 @@ export async function ensureFullBody({ tenantId, threadId, uid, force }: EnsureA
             for await (const it of client.fetch(String(uid), { uid: true, source: true, bodyStructure: true })) {
                 const src = (it as any)?.source;
                 bodyStruct = (it as any)?.bodyStructure || null;
-
                 if (src) {
                     sourceBuf = Buffer.isBuffer(src)
                         ? src
@@ -76,37 +88,45 @@ export async function ensureFullBody({ tenantId, threadId, uid, force }: EnsureA
                 }
                 break;
             }
-        } catch {
-            // swallow; we’ll try fallback below
-        }
+        } catch {/* fall through to search */}
 
         // Fallback: if we didn’t get the source (maybe moved folders), search by Message-ID header
         if (!sourceBuf && doc.msgId) {
-            try {
-                const hits = await client.search({ header: { "message-id": doc.msgId } });
-                if (Array.isArray(hits) && hits.length) {
-                    const hitUid = String(hits[hits.length - 1]);
-                    // We also want bodyStructure here if possible
-                    for await (const it of client.fetch(hitUid, { uid: true, source: true, bodyStructure: true })) {
-                        const src = (it as any)?.source;
-                        bodyStruct = bodyStruct || (it as any)?.bodyStructure || null;
+            // Ask for UIDs; result can be number[] or false
+            const searchRes = await client.search(
+                { header: { "message-id": doc.msgId } },
+                { uid: true }
+            );
 
-                        if (src) {
-                            sourceBuf = Buffer.isBuffer(src)
-                                ? src
-                                : await new Promise<Buffer>((resolve, reject) => {
-                                    const chunks: Buffer[] = [];
-                                    (src as NodeJS.ReadableStream)
-                                        .on("data", (c) => chunks.push(Buffer.from(c)))
-                                        .on("end", () => resolve(Buffer.concat(chunks)))
-                                        .on("error", reject);
-                                });
-                        }
-                        break;
+            const hits: number[] = Array.isArray(searchRes) ? searchRes : [];
+            if (hits.length > 0) {
+                const hitUid = String(hits[hits.length - 1]); // last occurrence
+
+                for await (const it of client.fetch(hitUid, { uid: true, source: true, bodyStructure: true })) {
+                    const src = (it as any)?.source;
+                    bodyStruct = bodyStruct || (it as any)?.bodyStructure || null;
+
+                    if (src) {
+                        sourceBuf = Buffer.isBuffer(src)
+                            ? src
+                            : await new Promise<Buffer>((resolve, reject) => {
+                                const chunks: Buffer[] = [];
+                                (src as NodeJS.ReadableStream)
+                                    .on("data", (c) => chunks.push(Buffer.from(c)))
+                                    .on("end", () => resolve(Buffer.concat(chunks)))
+                                    .on("error", reject);
+                            });
                     }
+                    break;
                 }
-            } catch {
-                /* ignore */
+
+                // If we found it in the *currently open* mailbox, persist the folder
+                if (sourceBuf && opened && opened !== recordedFolder) {
+                    await messages.updateOne(
+                        { tenantId, threadId, uid },
+                        { $set: { folder: opened } }
+                    );
+                }
             }
         }
 
