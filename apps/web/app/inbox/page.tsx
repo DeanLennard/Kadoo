@@ -12,7 +12,7 @@ import ComposeModal from "@/components/mail/ComposeModal";
 import Attachments from "@/components/mail/Attachments";
 
 type Folder = { id: string; name: string; unread?: number };
-type ThreadRow = { _id: string; subject: string; participants: string[]; lastTs: string | Date; unread?: number };
+type ThreadRow = { _id: string; subject: string; participants: string[]; lastTs: string | Date; unread?: number; labels?: string[]; };
 type Message = { _id: string; from: string; to: string[]; date: string | Date; uid?: number; text?: string; html?: string; folder?: string; attachments?: any };
 type ThreadData = { thread: { _id: string; subject: string; participants: string[] }, messages: Message[] };
 
@@ -28,6 +28,66 @@ function formatLastTs(ts: string | Date) {
     }
     // Day + 3-letter month e.g. 19 Oct
     return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short" }).replace(",", "");
+}
+
+const KNOWN_LABEL_COLORS: Record<string, string> = {
+    spam: "bg-red-100 text-red-700 border-red-200",
+    newsletter: "bg-sky-100 text-sky-700 border-sky-200",
+    invoice: "bg-amber-100 text-amber-700 border-amber-200",
+    billing: "bg-yellow-100 text-yellow-700 border-yellow-200",
+    support: "bg-indigo-100 text-indigo-700 border-indigo-200",
+    sales: "bg-emerald-100 text-emerald-700 border-emerald-200",
+    intro: "bg-violet-100 text-violet-700 border-violet-200",
+    personal: "bg-pink-100 text-pink-700 border-pink-200",
+    calendar: "bg-cyan-100 text-cyan-700 border-cyan-200",
+    legal: "bg-stone-100 text-stone-700 border-stone-200",
+    hr: "bg-fuchsia-100 text-fuchsia-700 border-fuchsia-200",
+    ops: "bg-lime-100 text-lime-700 border-lime-200",
+    shipping: "bg-teal-100 text-teal-700 border-teal-200",
+    recruiting: "bg-rose-100 text-rose-700 border-rose-200",
+    partner: "bg-blue-100 text-blue-700 border-blue-200",
+    product: "bg-purple-100 text-purple-700 border-purple-200",
+    "bug": "bg-orange-100 text-orange-700 border-orange-200",
+    "feature-request": "bg-green-100 text-green-700 border-green-200",
+};
+
+const FALLBACK_PALETTE = [
+    "bg-gray-100 text-gray-700 border-gray-200",
+    "bg-slate-100 text-slate-700 border-slate-200",
+    "bg-zinc-100 text-zinc-700 border-zinc-200",
+    "bg-neutral-100 text-neutral-700 border-neutral-200",
+    "bg-sky-100 text-sky-700 border-sky-200",
+    "bg-emerald-100 text-emerald-700 border-emerald-200",
+    "bg-violet-100 text-violet-700 border-violet-200",
+    "bg-amber-100 text-amber-700 border-amber-200",
+];
+
+function hashLabel(s: string) {
+    let h = 5381;
+    for (let i = 0; i < s.length; i++) h = ((h << 5) + h) ^ s.charCodeAt(i);
+    return Math.abs(h);
+}
+
+function badgeClass(label: string) {
+    const key = label.toLowerCase();
+    return (
+        KNOWN_LABEL_COLORS[key] ||
+        FALLBACK_PALETTE[hashLabel(key) % FALLBACK_PALETTE.length]
+    );
+}
+
+function LabelBadge({ children }: { children: string }) {
+    return (
+        <span
+            className={
+                "inline-flex items-center px-2 py-[2px] rounded-full text-[10px] font-medium border " +
+                badgeClass(children)
+            }
+            title={children}
+        >
+      {children}
+    </span>
+    );
 }
 
 export default function Inbox3Pane() {
@@ -155,6 +215,11 @@ export default function Inbox3Pane() {
                 <div>
                     <div className="k-h2">{thread.subject}</div>
                     <div className="text-sm k-muted">{thread.participants?.join(", ")}</div>
+                    {Array.isArray((thread as any).labels) && (thread as any).labels.length > 0 && (
+                        <div className="mt-2 flex flex-wrap gap-1">
+                            {(thread as any).labels.map((l: string) => <LabelBadge key={l}>{l}</LabelBadge>)}
+                        </div>
+                    )}
                 </div>
                 <div className="space-y-3">
                     {messages.map(m => {
@@ -307,6 +372,17 @@ export default function Inbox3Pane() {
                                         <div className={clsx("text-xs truncate", isUnread ? "font-semibold" : "k-muted")}>
                                             {t.participants?.join(", ")}
                                         </div>
+                                        {/* badges */}
+                                        {t.labels?.length ? (
+                                            <div className="mt-1 flex flex-wrap gap-1">
+                                                {t.labels.slice(0, 6).map(l => (
+                                                    <LabelBadge key={l}>{l}</LabelBadge>
+                                                ))}
+                                                {t.labels.length > 6 && (
+                                                    <span className="text-[10px] k-muted">+{t.labels.length - 6} more</span>
+                                                )}
+                                            </div>
+                                        ) : null}
                                     </button>
                                 </li>
                             );

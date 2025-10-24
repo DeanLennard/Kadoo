@@ -31,7 +31,7 @@ export async function GET(req: Request) {
         .toArray();
 
     return NextResponse.json({
-        thread: { _id: t._id, subject: t.subject, participants: t.participants, folder: (t as any).folder },
+        thread: { _id: t._id, subject: t.subject, participants: t.participants, folder: (t as any).folder, labels: t.labels },
         messages: msgs
     });
 }

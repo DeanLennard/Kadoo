@@ -10,7 +10,7 @@ type GenerateArgs = {
     subject: string;
     settings: TenantSettings & {
         senderName?: string;
-        companyName?: string;       // <-- ensure this exists on your TenantSettings
+        companyName?: string;
         signatureHtml?: string;
     };
 };

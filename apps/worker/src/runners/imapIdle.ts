@@ -50,87 +50,96 @@ export async function runImapIdle(connector: MailboxConnector, client: ImapFlow)
         // last 14 days
         const since = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
 
-        // 1) Search returns sequence numbers by default. Ask for UIDs:
-        const uids = await client.search({ since }, { uid: true }) as number[]; // imapflow returns number[]
-
-        if (!uids || uids.length === 0) {
+        // 1) Search by date, but ask for UIDs explicitly
+        const allUids = (await client.search({ since }, { uid: true })) as number[];
+        if (!allUids || allUids.length === 0) {
             await setCursor(connector._id, connector.tenantId, { uidValidity, lastUid });
             return;
         }
 
-        // Only process UIDs above the saved cursor
-        const newUids = uids.filter((u) => u > lastUid).sort((a, b) => a - b);
+        // Only UIDs above the saved cursor
+        const newUids = allUids.filter(u => u > lastUid).sort((a, b) => a - b);
         if (newUids.length === 0) return;
+
+        // --- use array chunks, not a seqset string ---
+        const chunk = <T,>(arr: T[], size: number) =>
+            Array.from({ length: Math.ceil(arr.length / size) }, (_, i) =>
+                arr.slice(i * size, i * size + size)
+            );
 
         let maxSeenUid = lastUid;
 
-        // 2) Fetch by UID list; request envelope + uid
-        for await (const it of client.fetch(newUids, { envelope: true }, { uid: true })) {
-            const msg = it as any;
-            if (!msg?.uid || typeof msg.uid !== "number") continue;
+        for (const uid of newUids) {
+            try {
+                // ✅ third arg is options → uid mode enabled
+                const it = await client.fetchOne(uid, { envelope: true }, { uid: true });
+                if (it === false) continue;
 
-            const date      = msg.envelope?.date ?? new Date();
-            const subject   = msg.envelope?.subject ?? "(no subject)";
-            const from      = msg.envelope?.from?.[0]?.address ?? "";
-            const to        = (msg.envelope?.to ?? []).map((a: any) => a.address!).filter(Boolean);
-            const messageId = msg.envelope?.messageId ?? String(msg.uid);
-            const threadId  = `${connector._id}:${messageId}`;
+                const msg = it as any;
+                const date      = msg.envelope?.date ?? new Date();
+                const subject   = msg.envelope?.subject ?? "(no subject)";
+                const from      = msg.envelope?.from?.[0]?.address ?? "";
+                const to        = (msg.envelope?.to ?? []).map((a: any) => a.address!).filter(Boolean);
+                const messageId = msg.envelope?.messageId ?? String(uid);
+                const threadId  = `${connector._id}:${messageId}`;
 
-            // Upsert thread (with lastUid/lastMsgId)
-            await threadsCol.updateOne(
-                { _id: threadId },
-                {
-                    $setOnInsert: {
-                        _id: threadId,
-                        tenantId: connector.tenantId,
-                        connectorId: connector._id,
-                        subject,
-                        participants: [from, ...to],
-                        status: "awaiting_us",
-                        facts: [],
-                        lastMessageIds: [],
-                        createdAt: date,
-                        folder: "INBOX",
+                await threadsCol.updateOne(
+                    { _id: threadId },
+                    {
+                        $setOnInsert: {
+                            _id: threadId,
+                            tenantId: connector.tenantId,
+                            connectorId: connector._id,
+                            subject,
+                            participants: [from, ...to],
+                            status: "awaiting_us",
+                            facts: [],
+                            lastMessageIds: [],
+                            createdAt: date,
+                            folder: "INBOX",
+                        },
+                        $set: { lastTs: date, lastUid: uid, lastMsgId: messageId },
+                        $addToSet: { messageUids: uid },
+                        $inc: { unread: 1 },
                     },
-                    $set: { lastTs: date, lastUid: msg.uid, lastMsgId: messageId },
-                    $addToSet: { messageUids: msg.uid },
-                    $inc: { unread: 1 },
-                },
-                { upsert: true }
-            );
+                    { upsert: true }
+                );
 
-            // Optional small snippet (don’t pull full body here)
-            const dl = await (client as any).download(String(msg.uid), { uid: true }).catch(() => null as any);
-            const text = toUtf8Snippet(dl?.content);
+                const dl = await (client as any).download(String(uid), { uid: true }).catch(() => null as any);
+                const text = toUtf8Snippet(dl?.content);
 
-            await messagesCol.updateOne(
-                { _id: `${threadId}:${msg.uid}` },
-                {
-                    $set: {
-                        _id: `${threadId}:${msg.uid}`,
-                        tenantId: connector.tenantId,
-                        threadId,
-                        msgId: messageId,
-                        uid: msg.uid,
-                        uidValidity,
-                        from,
-                        to,
-                        cc: [],
-                        date,
-                        text,
-                        folder: "INBOX",
+                await messagesCol.updateOne(
+                    { _id: `${threadId}:${uid}` },
+                    {
+                        $set: {
+                            _id: `${threadId}:${uid}`,
+                            tenantId: connector.tenantId,
+                            threadId,
+                            msgId: messageId,
+                            uid,
+                            uidValidity: Number(mb.uidValidity ?? 0),
+                            from, to, cc: [],
+                            date, text,
+                            folder: "INBOX",
+                        },
                     },
-                },
-                { upsert: true }
-            );
+                    { upsert: true }
+                );
 
-            // Publish for worker to classify/move/fetch-full-body
-            await publish(TOPIC_INGEST, { tenantId: connector.tenantId, threadId, uid: msg.uid });
-            if (msg.uid > maxSeenUid) maxSeenUid = msg.uid;
+                await publish(TOPIC_INGEST, { tenantId: connector.tenantId, threadId, uid });
+                if (uid > maxSeenUid) maxSeenUid = uid;
+
+            } catch (e) {
+                console.warn(`[imapIdle] fetchOne failed for uid=${uid}`, e);
+                continue;
+            }
         }
 
         if (maxSeenUid > lastUid) {
-            await setCursor(connector._id, connector.tenantId, { uidValidity, lastUid: maxSeenUid });
+            await setCursor(connector._id, connector.tenantId, {
+                uidValidity: Number(mb.uidValidity ?? 0),
+                lastUid: maxSeenUid
+            });
         }
     }
 

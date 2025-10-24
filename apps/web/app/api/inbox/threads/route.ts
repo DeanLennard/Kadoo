@@ -13,7 +13,7 @@ export async function GET(req: Request) {
 
     const threads = await (await col<MailThread>("MailThread"))
         .find({ tenantId, folder, lastTs: { $gte: since } })
-        .project({ _id: 1, subject: 1, participants: 1, lastTs: 1, unread: 1 })
+        .project({ _id: 1, subject: 1, participants: 1, lastTs: 1, unread: 1, labels: 1 })
         .sort({ lastTs: -1 })
         .limit(200)
         .toArray();
