@@ -9,7 +9,9 @@
     "baseUrl": ".",
     "paths": {
       "@kadoo/types": ["packages/types/src/index.ts"],
-      "@kadoo/config": ["packages/config/src/index.ts"]
+      "@kadoo/config": ["packages/config/src/index.ts"],
+      "@kadoo/server-utils": ["packages/server-utils/src/index.ts"],
+      "@kadoo/server-utils/secrets": ["packages/server-utils/src/secrets.ts"]
     }
   }
 }

@@ -81,3 +81,31 @@ export interface MailMessage {
     priority?: 0|1|2|3;
     autoDraftId?: string;
 }
+
+export type CalConnector = {
+    _id: string;
+    tenantId: string;
+    type: 'caldav';
+    principalUrl: string;      // e.g. https://cal.example.com/dav/principals/user/
+    calendarUrl: string;       // e.g. https://cal.example.com/dav/calendars/user/personal/
+    username?: string;         // optional if OAuth-style proxy in future
+    passwordEnc?: string;      // envelope-encrypted
+    syncToken?: string;        // for REPORT sync-collection
+    status: 'active'|'error'|'needs_auth';
+    createdAt: Date; updatedAt: Date;
+};
+
+export type CalEvent = {
+    _id: string;
+    tenantId: string;
+    connectorId: string;
+    uid: string;               // iCalendar UID
+    etag: string;
+    start: Date; end: Date;
+    summary?: string;
+    location?: string;
+    attendees?: { email: string; name?: string; role?: 'REQ-PARTICIPANT'|'OPT-PARTICIPANT' }[];
+    organizer?: string;
+    rawIcs: string;
+    updatedAt: Date;
+};

@@ -50,7 +50,7 @@ export const POST = withApiAuth(async (req, { tenantId, session }) => {
     await executeQueue.add(
         doc.action.type || "do",
         { ...doc.action.payload, logId: _id.toString(), tenantId },
-        { removeOnComplete: true }
+        { removeOnComplete: true, jobId: `exec:${tenantId}:${_id.toString()}` }
     );
 
     return NextResponse.json({ ok: true });

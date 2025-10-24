@@ -14,6 +14,14 @@ type SmtpState = {
     tlsServername?: string;       // NEW
 };
 
+type CaldavState = {
+    principalUrl: string;
+    calendarUrl: string;
+    username: string;
+    password: string; // store encrypted server-side
+};
+
+
 export default function SettingsPage() {
     const [imap, setImap] = useState<ImapState>({
         host: "imap.extendcp.co.uk",
@@ -35,6 +43,15 @@ export default function SettingsPage() {
     const [busy, setBusy] = useState(false);
     const [ok, setOk] = useState<boolean|null>(null);
 
+    const [cal, setCal] = useState<CaldavState>({
+        principalUrl: "https://cal.example.com/dav/principals/user/",
+        calendarUrl: "https://cal.example.com/dav/calendars/user/personal/",
+        username: "",
+        password: "",
+    });
+    const [calBusy, setCalBusy] = useState(false);
+    const [calOk, setCalOk] = useState<boolean|null>(null);
+
     async function save() {
         setBusy(true); setOk(null);
         try {
@@ -45,6 +62,18 @@ export default function SettingsPage() {
             });
             setOk(res.ok);
         } finally { setBusy(false); }
+    }
+
+    async function saveCal() {
+        setCalBusy(true); setCalOk(null);
+        try {
+            const res = await fetch("/api/connectors/calendar/caldav", {
+                method:"POST",
+                headers:{ "Content-Type":"application/json" },
+                body: JSON.stringify(cal),
+            });
+            setCalOk(res.ok);
+        } finally { setCalBusy(false); }
     }
 
     return (
@@ -171,6 +200,49 @@ export default function SettingsPage() {
                     {ok === true  && <span className="k-badge k-badge-mint">Saved</span>}
                     {ok === false && <span className="k-badge k-badge-warm">Failed</span>}
                 </div>
+            </Card>
+
+            <Card className="space-y-4">
+                <div className="k-h2">Calendar (CalDAV)</div>
+
+                <label className="block text-sm mb-1">Principal URL</label>
+                <input className="w-full border rounded p-2"
+                       value={cal.principalUrl}
+                       onChange={e=>setCal({...cal,principalUrl:e.target.value})}/>
+                <p className="text-xs k-muted mt-1">
+                    e.g. Fastmail/iCloud/Nextcloud CalDAV principal.
+                </p>
+
+                <label className="block text-sm mb-1 mt-3">Calendar URL</label>
+                <input className="w-full border rounded p-2"
+                       value={cal.calendarUrl}
+                       onChange={e=>setCal({...cal,calendarUrl:e.target.value})}/>
+
+                <div className="grid grid-cols-2 gap-2 mt-3">
+                    <div>
+                        <label className="block text-sm mb-1">Username</label>
+                        <input className="w-full border rounded p-2"
+                               value={cal.username}
+                               onChange={e=>setCal({...cal,username:e.target.value})}/>
+                    </div>
+                    <div>
+                        <label className="block text-sm mb-1">App password</label>
+                        <input className="w-full border rounded p-2" type="password"
+                               value={cal.password}
+                               onChange={e=>setCal({...cal,password:e.target.value})}/>
+                    </div>
+                </div>
+
+                <div className="flex gap-3 mt-3">
+                    <Button onClick={saveCal} disabled={calBusy}>
+                        {calBusy ? "Saving…" : "Save calendar"}
+                    </Button>
+                    {calOk === true  && <span className="k-badge k-badge-mint">Saved</span>}
+                    {calOk === false && <span className="k-badge k-badge-warm">Failed</span>}
+                </div>
+                <p className="text-xs k-muted">
+                    We only store credentials encrypted. Use an app-specific password if your provider supports it.
+                </p>
             </Card>
         </main>
     );

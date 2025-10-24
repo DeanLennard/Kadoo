@@ -1,8 +1,15 @@
 // apps/worker/src/queue.ts
+import { pickSlot } from "./policy/availability";
+import { buildIcs } from "./util/ics";
+import { upsertEvent } from "./adapters/caldav";
+
 export type IngestJob = { tenantId: string; threadId: string; uid: number };
 
 type Handler<T> = (payload: T) => Promise<void>;
 const subs: Record<string, Handler<any>[]> = {};
+
+const checkThreshold = (confidence: number | undefined, min: number) =>
+    typeof confidence === "number" ? confidence >= min : true;
 
 // simple in-memory de-dupe: jobId -> expiresAt
 const inflight = new Map<string, number>();

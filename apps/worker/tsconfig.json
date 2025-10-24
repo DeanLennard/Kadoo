@@ -1,7 +1,14 @@
 ﻿{
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "outDir": "dist"
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "target": "ES2022",
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "skipLibCheck": true,
+    "types": []
   },
-  "include": ["src"]
+  "include": ["src", "**/*.ts", "types"]
 }

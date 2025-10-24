@@ -7,6 +7,10 @@ import type { MailboxConnector, MailThread, MailMessage } from "@kadoo/types";
 import { makeSmtp } from "../adapters/smtp";
 import { appendDraft } from "../adapters/imap-append";
 import { emit } from "../pub";
+import { checkThreshold } from "../policy/thresholds";
+import { pickSlot } from "../policy/availability";
+import { buildIcs } from "../util/ics";
+import { upsertEvent } from "../adapters/caldav";
 
 export const eventsQueue = new Queue("events", { connection });
 export const decisionsQueue = new Queue("decisions", { connection });
@@ -147,6 +151,114 @@ export const executeWorker = new Worker(
                 );
                 return;
             }
+
+            case "schedule_meeting": {
+                // Pull the action payload from the decision log
+                // Expecting: { attendeeEmail, durationMin, windowISO: string[], conference? }
+                const a = (doc.action.payload ?? doc.action) as {
+                    attendeeEmail: string;
+                    durationMin: number;
+                    windowISO: string[];
+                    conference?: "meet" | "teams" | "zoom" | "jitsi";
+                };
+
+                // Confidence (from your pending log)
+                const confidence: number | undefined = doc.confidence;
+
+                // Load an EA employee for thresholds (or default 0.75)
+                const employeesCol = await col("Employee");
+                const employee =
+                    (await employeesCol.findOne({ tenantId, role: "ea" })) ??
+                    ({ thresholds: { schedule: 0.75 } } as any);
+
+                if (!checkThreshold(confidence, employee.thresholds?.schedule ?? 0.75)) {
+                    await logs.updateOne(
+                        { _id, tenantId },
+                        { $set: { status: "denied", deniedReason: "threshold", updatedAt: new Date() } }
+                    );
+                    return;
+                }
+
+                // Choose a slot
+                const slot = await pickSlot({
+                    tenantId,
+                    windowISO: a.windowISO,
+                    durationMin: a.durationMin,
+                    buffers: { before: 10, after: 10 },
+                    minNoticeMin: 720, // 12h
+                });
+                if (!slot) {
+                    await logs.updateOne(
+                        { _id, tenantId },
+                        { $set: { status: "failed", failReason: "no_slot", updatedAt: new Date() } }
+                    );
+                    return;
+                }
+
+                // Load tenant to get organiser email / defaults
+                const tenants = await col("Tenant");
+                const tenantDoc = await tenants.findOne({ _id: tenantId });
+                const organizerEmail =
+                    tenantDoc?.organizerEmail ||
+                    tenantDoc?.settings?.defaultOrganizer ||
+                    "no-reply@kadoo.local";
+
+                // Build ICS
+                const ics = buildIcs({
+                    summary: `Meeting with ${tenantDoc?.name ?? "Kadoo"}`,
+                    start: slot.start,
+                    end: slot.end,
+                    attendees: [{ email: a.attendeeEmail }],
+                    organizer: organizerEmail,
+                    conference: a.conference,
+                    location: tenantDoc?.settings?.defaultLocation,
+                    description: `Auto-booked by Kadoo EA`,
+                });
+
+                // Find CalDAV connector
+                const calConns = await col("cal_connectors");
+                const cal = await calConns.findOne({ tenantId, type: "caldav", status: "active" });
+                if (!cal) {
+                    await logs.updateOne(
+                        { _id, tenantId },
+                        { $set: { status: "failed", failReason: "no_caldav_connector", updatedAt: new Date() } }
+                    );
+                    return;
+                }
+
+                // Create event on CalDAV
+                const href = await upsertEvent(
+                    {
+                        principalUrl: cal.principalUrl,
+                        calendarUrl: cal.calendarUrl,
+                        username: cal.username,
+                        password: /* decrypt */ cal.passwordEnc,
+                        syncToken: cal.syncToken,
+                    },
+                    ics
+                );
+
+                // Mark executed
+                await logs.updateOne(
+                    { _id, tenantId },
+                    {
+                        $set: {
+                            status: "executed",
+                            executedAt: new Date(),
+                            result: { ok: true, kind: "calendar", href, slot },
+                        },
+                    }
+                );
+
+                await emit(tenantId, {
+                    kind: "meeting_scheduled",
+                    href,
+                    slot,
+                    attendee: a.attendeeEmail,
+                });
+                return;
+            }
+
             default:
                 // fallback existing behaviour
                 await logs.updateOne(

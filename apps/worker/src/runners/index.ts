@@ -3,6 +3,7 @@ import { col } from "../db";
 import type { MailboxConnector } from "@kadoo/types";
 import { createImapClient } from "./imapClient";
 import { runImapIdle } from "./imapIdle";
+import { startCalDAVSync } from './caldavSync';
 
 export async function startRunners() {
     const connectors = await col<MailboxConnector>("MailboxConnector");
@@ -21,4 +22,6 @@ export async function startRunners() {
             }
         })();
     }
+
+    startCalDAVSync();
 }
