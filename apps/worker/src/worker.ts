@@ -8,6 +8,7 @@ import { decideAction } from "./workers/decide";
 import { generateDraft } from "./workers/generateDraft";
 import { ensureFullBody } from "./workers/ensureBody";
 import {resolveSpamMailbox} from "./util/resolveSpamMailbox";
+import { appendImapDraft } from "./workers/appendImapDraft";
 
 const LOCK_TTL_MS = 5 * 60 * 1000;
 
@@ -159,6 +160,11 @@ subscribe<IngestJob>(TOPIC_INGEST, async ({ tenantId, threadId, uid }) => {
         await drafts.insertOne(draft);
         await messages.updateOne({ tenantId, threadId, uid }, { $set: { autoDraftId: draft._id } });
         console.log(`[worker] generateDraft.inserted`, { draftId: draft._id });
+
+        const imapInfo = await appendImapDraft({ tenantId, threadId, uidRef: uid, draft });
+        if (imapInfo) {
+            console.log("[worker] imap draft appended", imapInfo);
+        }
 
         // (Optional) store to IMAP Drafts so clients can see it
         // appendDraftToImap(conn, draft.html/text)
