@@ -71,7 +71,7 @@ export async function appendImapDraft(args: {
 
         // rfc822 is a string per your buildRfc822()
         const res = await (client as any).append(
-            payload,                                  // already a string
+            payload,
             { flags: ["\\Draft"] } as AppendOptionsLite
         );
         const resUid = res && typeof res === "object" ? (res as any).uid ?? null : null;

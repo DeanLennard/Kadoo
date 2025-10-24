@@ -92,7 +92,7 @@ export async function runImapIdle(connector: MailboxConnector, client: ImapFlow)
                         createdAt: date,
                         folder: "INBOX",
                     },
-                    $set: { lastTs: date, lastUid: msg.uid, lastMsgId: messageId, folder: "INBOX" },
+                    $set: { lastTs: date, lastUid: msg.uid, lastMsgId: messageId },
                     $addToSet: { messageUids: msg.uid },
                     $inc: { unread: 1 },
                 },

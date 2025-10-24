@@ -6,33 +6,38 @@ type GenerateArgs = {
     tenantId: string;
     threadId: string;
     uidRef: number;
-    msg: MailMessage & { labels?: string[]; summary?: string; priority?: 1|2|3 };
-    subject: string;                 // <-- add
-    settings: TenantSettings & { senderName?: string; signatureHtml?: string };
+    msg: MailMessage & { labels?: string[]; summary?: string; priority?: 1 | 2 | 3 };
+    subject: string;
+    settings: TenantSettings & {
+        senderName?: string;
+        companyName?: string;       // <-- ensure this exists on your TenantSettings
+        signatureHtml?: string;
+    };
 };
 
 function inferConfidence(
     parsed: { text?: string; html?: string },
     msg: { text?: string; html?: string }
 ): number {
-    // Very simple heuristic to start:
-    // - If model returned [NO_DRAFT], confidence is very low.
-    // - If body was empty and it still produced text, keep it modest.
     const out = (parsed.text || parsed.html || "").trim();
     if (/^\[NO_DRAFT\]$/i.test(out)) return 0.1;
-
     const hadBody = Boolean((msg.text || msg.html || "").trim());
-    return hadBody ? 0.75 : 0.55; // tweak as you learn
+    return hadBody ? 0.75 : 0.55;
+}
+
+// naive detector to avoid double-signing if model already added a closing
+function looksSigned(s: string): boolean {
+    const tail = s.trim().slice(-200).toLowerCase();
+    return /\b(best|kind|warm|many|thanks|regards)\b[\s,]*\n/.test(tail) ||
+        /\b(best|kind|warm|many|thanks)\b[\s,]*<br\/?>/i.test(tail);
 }
 
 export async function generateDraft(args: GenerateArgs): Promise<Draft> {
     const { tenantId, threadId, uidRef, msg, subject, settings } = args;
 
-    const signatureHtml = settings.signatureHtml || "";
-    const from = settings.senderName || (msg.to?.[0] ?? "Team");
-    const replySubject = subject.startsWith("Re:") ? subject : `Re: ${subject || ""}`;
+    const replySubject = subject?.toLowerCase().startsWith("re:") ? subject : `Re: ${subject || ""}`;
 
-    const system = `You write short, clear professional email replies. 
+    const system = `You write short, clear professional email replies.
 - Keep it under 8 sentences unless necessary.
 - Use UK spelling if ambiguous.
 - Ask exactly one question if clarification is needed.
@@ -40,7 +45,7 @@ export async function generateDraft(args: GenerateArgs): Promise<Draft> {
 - Do not invent facts.`;
 
     const user = `Compose a concise reply to the following email.
-Prefer helpful, friendly-neutral tone. 
+Prefer helpful, friendly-neutral tone.
 If the email is clearly spam or automated no thanks, write: "[NO_DRAFT]".
 Add a bullet list only if it materially improves clarity.
 
@@ -79,11 +84,52 @@ If appropriate, include a brief subject tweak (<=65 chars). Return as JSON:
 
     if (!parsed.html && !parsed.text) parsed.text = "[NO_DRAFT]";
 
+    // --- Build sign-off ---
+    const senderName = settings.senderName?.trim();
+    const companyName = settings.companyName?.trim();
+
+    const htmlSignature =
+        settings.signatureHtml?.trim() ||
+        (senderName
+            ? [
+                "<br><br>",
+                "Best regards,",
+                "<br/>",
+                `<strong>${escapeHtml(senderName)}</strong>`,
+                companyName ? `<br/>${escapeHtml(companyName)}` : "",
+            ].join("")
+            : "");
+
+    const textSignature =
+        senderName
+            ? [
+                "",
+                "",
+                "Best regards,",
+                senderName,
+                companyName ? companyName : "",
+            ].join("\n")
+            : "";
+
+    // Avoid double-signing if the model already signed
     let html = parsed.html || "";
     let text = parsed.text || "";
-    if (signatureHtml && !/^\s*\[NO_DRAFT\]\s*$/.test(text)) {
-        html = `${html}\n\n${signatureHtml}`;
-        text = `${text}\n\n-- \n${from}`;
+
+    const isNoDraft = /^\s*\[NO_DRAFT\]\s*$/.test(text) || /^\s*\[NO_DRAFT\]\s*$/.test(html);
+
+    if (!isNoDraft) {
+        if (html) {
+            const bareHtml = html.replace(/\s+$/g, "");
+            if (!looksSigned(stripHtml(bareHtml)) && htmlSignature) {
+                html = `${bareHtml}${htmlSignature}`;
+            }
+        }
+        if (text) {
+            const bareText = text.replace(/\s+$/g, "");
+            if (!looksSigned(bareText) && textSignature) {
+                text = `${bareText}${textSignature ? `\n${textSignature}` : ""}`;
+            }
+        }
     }
 
     const draft: Draft = {
@@ -102,4 +148,15 @@ If appropriate, include a brief subject tweak (<=65 chars). Return as JSON:
     };
 
     return draft;
+}
+
+// --- small helpers ---
+function stripHtml(s: string): string {
+    return s.replace(/<[^>]+>/g, "").replace(/&nbsp;/g, " ").trim();
+}
+function escapeHtml(s: string): string {
+    return s
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
 }

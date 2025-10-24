@@ -122,4 +122,7 @@ export type TenantSettings = {
     allowedDomains?: string[];
     blockedDomains?: string[];
     maxDailyDrafts?: number;
+    senderName?: string;
+    companyName?: string;
+    signatureHtml?: string;
 };
