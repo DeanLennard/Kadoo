@@ -1,0 +1,4 @@
+
+> kadoo-worker@0.0.1 build C:\Users\Dean\Projects\kadoo\apps\worker
+> tsc -p tsconfig.json
+

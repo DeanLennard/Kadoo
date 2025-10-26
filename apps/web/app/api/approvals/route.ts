@@ -1,5 +1,5 @@
 // apps/web/app/api/approvals/route.ts
-import { NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { col } from "@/lib/db";
 import type { DecisionLog } from "@/lib/models";
 import { withApiAuth } from "@/lib/api-auth"; // from the helper I shared

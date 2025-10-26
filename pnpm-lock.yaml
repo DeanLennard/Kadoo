@@ -157,6 +157,12 @@ importers:
 
   apps/worker:
     dependencies:
+      '@kadoo/config':
+        specifier: workspace:*
+        version: link:../../packages/config
+      '@kadoo/server-utils':
+        specifier: workspace:*
+        version: link:../../packages/server-utils
       '@kadoo/types':
         specifier: workspace:*
         version: link:../../packages/types

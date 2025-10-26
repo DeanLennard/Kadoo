@@ -1,0 +1,62 @@
+
+> web@0.1.0 build C:\Users\Dean\Projects\kadoo\apps\web
+> next build --turbopack
+
+   ▲ Next.js 15.5.6 (Turbopack)
+   - Environments: .env
+
+   Creating an optimized production build ...
+ ✓ Finished writing to disk in 84ms
+ ✓ Compiled successfully in 2.3s
+   Skipping validation of types
+   Skipping linting
+   Collecting page data ...
+   Generating static pages (0/28) ...
+   Generating static pages (7/28) 
+   Generating static pages (14/28) 
+   Generating static pages (21/28) 
+ ✓ Generating static pages (28/28)
+   Finalizing page optimization ...
+   Collecting build traces ...
+
+Route (app)                             Size  First Load JS
+┌ ○ /                                3.42 kB         127 kB
+├ ○ /_not-found                          0 B         123 kB
+├ ƒ /api/approvals                       0 B            0 B
+├ ƒ /api/approvals/[id]                  0 B            0 B
+├ ƒ /api/auth/[...nextauth]              0 B            0 B
+├ ƒ /api/calendar/events                 0 B            0 B
+├ ƒ /api/connectors/calendar/caldav      0 B            0 B
+├ ƒ /api/connectors/mail                 0 B            0 B
+├ ƒ /api/healthz                         0 B            0 B
+├ ƒ /api/inbox/attachment                0 B            0 B
+├ ƒ /api/inbox/compose                   0 B            0 B
+├ ƒ /api/inbox/delete                    0 B            0 B
+├ ƒ /api/inbox/drafts                    0 B            0 B
+├ ƒ /api/inbox/fetch-message             0 B            0 B
+├ ƒ /api/inbox/folders                   0 B            0 B
+├ ƒ /api/inbox/reply                     0 B            0 B
+├ ƒ /api/inbox/sync                      0 B            0 B
+├ ƒ /api/inbox/thread                    0 B            0 B
+├ ƒ /api/inbox/threads                   0 B            0 B
+├ ƒ /api/realtime/sse                    0 B            0 B
+├ ƒ /api/test/decide                     0 B            0 B
+├ ƒ /api/test/enqueue                    0 B            0 B
+├ ○ /approvals                       1.81 kB         125 kB
+├ ○ /calendar                        5.62 kB         129 kB
+├ ○ /dashboard                       1.85 kB         125 kB
+├ ○ /inbox                           14.9 kB         138 kB
+├ ○ /login                             559 B         124 kB
+└ ○ /settings                        1.96 kB         125 kB
++ First Load JS shared by all         132 kB
+  ├ chunks/3429e5a2afb5e210.js       20.5 kB
+  ├ chunks/70f1480f48979e11.js       59.2 kB
+  ├ chunks/af46cc2f655fe063.js       17.2 kB
+  └ other shared chunks (total)      35.5 kB
+
+
+ƒ Middleware                         39.2 kB
+
+○  (Static)   prerendered as static content
+ƒ  (Dynamic)  server-rendered on demand
+

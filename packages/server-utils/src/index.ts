@@ -1,2 +1,2 @@
 // packages/server-utils/src/index.ts
-export * from "./secrets";
+export * from "./secrets.js";

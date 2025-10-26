@@ -1,12 +1,13 @@
 // apps/worker/src/runners/caldavSync.ts
 import { col } from "../db";
 import { listDelta, listRange, parseIcs, listCollections, makeAgentForUrl, normaliseCalUrl } from "../adapters/caldav";
+import { decrypt } from "@kadoo/server-utils/secrets";
 
 type CalObj = { url: string; etag?: string; data?: string };
 
 const SYNC_INTERVAL_MS = 60_000;
-const LOOKAHEAD_DAYS = 30;
-const SEED_LOOKBACK_DAYS = 1; // include yesterday to catch late changes
+const SEED_LOOKBACK_DAYS = 365;
+const LOOKAHEAD_DAYS = 365;
 
 export async function startCalDAVSync() {
     console.log("[caldav.sync] starting");
@@ -44,6 +45,7 @@ async function tick() {
 
             const cache: CalObj[] = (c.cache as CalObj[] | undefined) ?? [];
             const hasSeed = cache.length > 0 || typeof c.syncToken === "string";
+            const pw = decrypt ? decrypt(c.passwordEnc) : c.passwordEnc;
 
             // ---- SEED: first-time full range fetch ----
             if (!hasSeed) {
@@ -57,7 +59,7 @@ async function tick() {
                         principalUrl: c.principalUrl,
                         calendarUrl: c.calendarUrl,
                         username: c.username,
-                        password: /* decrypt if needed */ c.passwordEnc,
+                        password: pw,
                         tlsServername: c.tlsServername,
                         allowSelfSigned: !!c.allowSelfSigned,
                     },
@@ -112,7 +114,7 @@ async function tick() {
                     principalUrl: c.principalUrl,
                     calendarUrl: c.calendarUrl,
                     username: c.username,
-                    password: /* decrypt if needed */ c.passwordEnc,
+                    password: pw,
                     tlsServername: c.tlsServername,
                     allowSelfSigned: !!c.allowSelfSigned,
                     syncToken: c.syncToken,

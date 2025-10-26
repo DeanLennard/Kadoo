@@ -1,0 +1,4 @@
+
+> @kadoo/server-utils@1.0.0 build C:\Users\Dean\Projects\kadoo\packages\server-utils
+> tsc -p tsconfig.json
+

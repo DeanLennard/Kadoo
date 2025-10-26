@@ -1,3 +1,4 @@
+// apps/web/app/calendar/page.tsx
 "use client";
 import useSWR from "swr";
 
@@ -66,7 +67,7 @@ function Day({ offsetDays, events }: { offsetDays: number; events: Event[] }) {
             <div className="space-y-2">
                 {busy.length === 0 && <div className="text-xs k-muted">Free</div>}
                 {busy.map((b, i) => (
-                    <div key={i} className="text-xs bg-neutral-100 dark:bg-neutral-800 rounded px-2 py-1">
+                    <div key={i}   className="text-xs bg-[var(--accent-bg,#e0f2fe)] dark:bg-[var(--accent-dark,#075985)] text-[var(--accent-fg,#075985)] dark:text-white rounded px-2 py-1">
                         {timeHM(b.start)}–{timeHM(b.end)} {b.summary ? `· ${b.summary}` : ""}
                     </div>
                 ))}

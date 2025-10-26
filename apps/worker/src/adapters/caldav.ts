@@ -70,6 +70,11 @@ export function makeAgentForUrl(urlStr: string, opts: { tlsServername?: string; 
     });
 }
 
+function authHeaders(username: string, password: string) {
+    const b64 = Buffer.from(`${username}:${password}`).toString("base64");
+    return { Authorization: `Basic ${b64}` };
+}
+
 export function normaliseCalUrl(raw: string) {
     const u = new URL(raw);
     // If using TLS on 8008, switch to HTTP
@@ -108,7 +113,7 @@ export async function listDelta(
         tlsServername: conn.tlsServername,
         allowSelfSigned: conn.allowSelfSigned,
     });
-    const headers = { Authorization: basicAuthHeader(conn.username, conn.password) };
+    const headers = authHeaders(conn.username, conn.password);
 
     try {
         const res = await collectionSync({
@@ -116,8 +121,7 @@ export async function listDelta(
             objects: known,
             objectMultiGet: calendarMultiGet,
             priorSyncToken: conn.syncToken,
-            headers,                             // ✅ send auth
-            fetchOptions: { agent } as any,
+            fetchOptions: { agent, headers } as any,
             detailedResult: true,
         });
 
@@ -136,8 +140,7 @@ export async function listDelta(
             calendar: { url: calUrl } as any,
             timeRange: { start: startISO, end: endISO },
             expand: true,
-            headers,                           // ✅ send auth
-            fetchOptions: { agent } as any,
+            fetchOptions: { agent, headers } as any,
         });
         return { created: [], updated: objs as any, deleted: [], newSyncToken: undefined };
     }
@@ -149,7 +152,7 @@ export async function listRange(conn: Conn, startISO: string, endISO: string) {
         tlsServername: conn.tlsServername,
         allowSelfSigned: conn.allowSelfSigned,
     });
-    const headers = { Authorization: basicAuthHeader(conn.username, conn.password) };
+    const headers = authHeaders(conn.username, conn.password)
 
     // give slower CalDAVs more breathing room
     const ac = new AbortController();
@@ -159,13 +162,21 @@ export async function listRange(conn: Conn, startISO: string, endISO: string) {
         console.log("[caldav.adapter] listRange", { calUrl, startISO, endISO });
         const objs = await fetchCalendarObjects({
             calendar: { url: calUrl } as any,
-            timeRange: { start: startISO, end: endISO },
-            expand: true,
-            headers,                           // ✅ send auth
-            fetchOptions: { agent, signal: ac.signal } as any,
+            // First try with no filter at all — some servers only return data this way.
+            fetchOptions: { agent, signal: ac.signal, headers } as any,
         });
+        if (!objs?.length) {
+            const wideStart = new Date(Date.now() - 365 * 86400_000).toISOString();
+            const wideEnd   = new Date(Date.now() + 365 * 86400_000).toISOString();
+            const withWindow = await fetchCalendarObjects({
+                calendar: { url: calUrl } as any,
+                timeRange: { start: wideStart, end: wideEnd },
+                fetchOptions: { agent, signal: ac.signal, headers } as any,
+            });
+            return withWindow as any;
+        }
         console.log("[caldav.adapter] listRange ok", { count: objs?.length ?? 0 });
-        return objs as Array<{ url: string; etag?: string; data?: string }>;
+        return objs as any;
     } finally {
         clearTimeout(t);
     }
@@ -177,13 +188,12 @@ export async function upsertEvent(conn: Conn, ics: string, href?: string) {
         tlsServername: conn.tlsServername,
         allowSelfSigned: conn.allowSelfSigned,
     });
-    const headers = { Authorization: basicAuthHeader(conn.username, conn.password) };
+    const headers = authHeaders(conn.username, conn.password);
 
     if (href) {
         await updateCalendarObject({
             calendarObject: { url: href, data: ics } as any,
-            headers,                         // ✅
-            fetchOptions: { agent } as any,
+            fetchOptions: { agent, headers } as any,
         });
         return href;
     }
@@ -191,8 +201,7 @@ export async function upsertEvent(conn: Conn, ics: string, href?: string) {
         calendar: { url: targetUrl } as any,
         filename: `${crypto.randomUUID()}.ics`,
         iCalString: ics,
-        headers,                           // ✅
-        fetchOptions: { agent } as any,
+        fetchOptions: { agent, headers } as any,
     });
     return (created as any)?.url ?? `${targetUrl.replace(/\/$/, "")}/${crypto.randomUUID()}.ics`;
 }
@@ -202,11 +211,10 @@ export async function removeEvent(conn: Conn, href: string) {
         tlsServername: conn.tlsServername,
         allowSelfSigned: conn.allowSelfSigned,
     });
-    const headers = { Authorization: basicAuthHeader(conn.username, conn.password) };
+    const headers = authHeaders(conn.username, conn.password);
     await deleteCalendarObject({
         calendarObject: { url: href } as any,
-        headers,                           // ✅
-        fetchOptions: { agent } as any,
+        fetchOptions: { agent, headers } as any,
     });
 }
 
