@@ -6,8 +6,8 @@
    - Environments: .env
 
    Creating an optimized production build ...
- ✓ Finished writing to disk in 84ms
- ✓ Compiled successfully in 2.3s
+ ✓ Finished writing to disk in 99ms
+ ✓ Compiled successfully in 2.2s
    Skipping validation of types
    Skipping linting
    Collecting page data ...
@@ -43,7 +43,7 @@ Route (app)                             Size  First Load JS
 ├ ƒ /api/test/decide                     0 B            0 B
 ├ ƒ /api/test/enqueue                    0 B            0 B
 ├ ○ /approvals                       1.81 kB         125 kB
-├ ○ /calendar                        5.62 kB         129 kB
+├ ○ /calendar                        5.66 kB         129 kB
 ├ ○ /dashboard                       1.85 kB         125 kB
 ├ ○ /inbox                           14.9 kB         138 kB
 ├ ○ /login                             559 B         124 kB

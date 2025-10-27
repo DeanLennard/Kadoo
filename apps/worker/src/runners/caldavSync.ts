@@ -5,7 +5,7 @@ import { decrypt } from "@kadoo/server-utils/secrets";
 
 type CalObj = { url: string; etag?: string; data?: string };
 
-const SYNC_INTERVAL_MS = 60_000;
+const SYNC_INTERVAL_MS = 5000;
 const SEED_LOOKBACK_DAYS = 365;
 const LOOKAHEAD_DAYS = 365;
 
@@ -25,7 +25,7 @@ async function tick() {
         .find({ type: "caldav", status: "active" })
         .toArray();
 
-    console.log("[caldav.sync] active connectors:", conns.length);
+    //console.log("[caldav.sync] active connectors:", conns.length);
 
     for (const c of conns as any[]) {
         try {
@@ -40,7 +40,7 @@ async function tick() {
                     allowSelfSigned: c.allowSelfSigned,
                 });
                 const disc = await listCollections(base, { username: c.username, password: c.passwordEnc }, { agent });
-                console.log("[caldav.discovery.raw]", base, disc.status, disc.body.slice(0, 800));
+                //console.log("[caldav.discovery.raw]", base, disc.status, disc.body.slice(0, 800));
             }
 
             const cache: CalObj[] = (c.cache as CalObj[] | undefined) ?? [];
@@ -53,7 +53,7 @@ async function tick() {
                 const startISO = new Date(now - SEED_LOOKBACK_DAYS * 86400_000).toISOString();
                 const endISO = new Date(now + LOOKAHEAD_DAYS * 86400_000).toISOString();
 
-                console.log("[caldav.sync] seeding", c._id, { startISO, endISO });
+                //console.log("[caldav.sync] seeding", c._id, { startISO, endISO });
                 const objs = await listRange(
                     {
                         principalUrl: c.principalUrl,
@@ -103,7 +103,7 @@ async function tick() {
                     }
                 );
 
-                console.log("[caldav.sync] seed complete", c._id, { upserts, cache: newCache.length });
+                //console.log("[caldav.sync] seed complete", c._id, { upserts, cache: newCache.length });
                 // continue to next connector; deltas will kick in next tick
                 continue;
             }
@@ -168,14 +168,14 @@ async function tick() {
                 }
             );
 
-            console.log("[caldav.sync] delta", c._id, {
+            /*console.log("[caldav.sync] delta", c._id, {
                 created: created.length,
                 updated: updated.length,
                 deleted: (deleted ?? []).length,
                 upserts,
                 cache: newCache.length,
                 syncToken: Boolean(newSyncToken),
-            });
+            });*/
 
         } catch (e: any) {
             const code = e?.code || e?.errno || "";

@@ -11,6 +11,12 @@ type EnsureArgs = {
     force?: boolean; // set true if you ever need to re-parse
 };
 
+type DownloadResult = {
+    // imapflow returns a stream/buffer-like "content"
+    // we type it loosely to keep TS happy
+    content: Buffer | NodeJS.ReadableStream | Uint8Array | string;
+};
+
 function collectAttachments(struct: any) {
     const out: Array<{ filename: string; contentType: string; size: number; partId: string }> = [];
     const walk = (n: any) => {
@@ -19,10 +25,12 @@ function collectAttachments(struct: any) {
         if (isLeaf) {
             const disp = String(n.disposition || "").toUpperCase();
             const fn = n?.dispositionParameters?.filename || n?.parameters?.name;
-            if (disp.includes("ATTACHMENT") || fn) {
+            const ct = `${n.type}/${n.subtype}`.toLowerCase();
+            // Treat inline text/calendar as an attachment-like thing so we can find it later
+            if (disp.includes("ATTACHMENT") || fn || ct === "text/calendar") {
                 out.push({
-                    filename: String(fn || "attachment"),
-                    contentType: `${n.type}/${n.subtype}`.toLowerCase(),
+                    filename: String(fn || (ct === "text/calendar" ? "invite.ics" : "attachment")),
+                    contentType: ct,
                     size: Number(n.size || 0),
                     partId: String(n.part),
                 });
@@ -32,6 +40,31 @@ function collectAttachments(struct: any) {
     };
     walk(struct);
     return out;
+}
+
+function toBuffer(maybe: any): Promise<Buffer> {
+    if (!maybe) return Promise.resolve(Buffer.alloc(0));
+    if (Buffer.isBuffer(maybe)) return Promise.resolve(maybe);
+    return new Promise<Buffer>((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        (maybe as NodeJS.ReadableStream)
+            .on("data", (c) => chunks.push(Buffer.from(c)))
+            .on("end", () => resolve(Buffer.concat(chunks)))
+            .on("error", reject);
+    });
+}
+
+async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+    let t: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, rej) => {
+        t = setTimeout(() => rej(new Error(`[ensureFullBody] timeout ${ms}ms: ${label}`)), ms);
+    });
+    try {
+        // @ts-ignore – Promise.race types
+        return await Promise.race([p, timeout]);
+    } finally {
+        if (t) clearTimeout(t);
+    }
 }
 
 export async function ensureFullBody({ tenantId, threadId, uid, force }: EnsureArgs) {
@@ -66,80 +99,50 @@ export async function ensureFullBody({ tenantId, threadId, uid, force }: EnsureA
         }
         if (!opened) return doc; // nowhere to search
 
-        // Prefer fetching both SOURCE and BODYSTRUCTURE so we can also persist attachments metadata
-        let sourceBuf: Buffer | null = null;
-        let bodyStruct: any | null = null;
+        const m: any = await withTimeout(
+            (client as any).fetchOne(uid, { source: true, bodyStructure: true }, { uid: true }),
+            20_000,
+            `fetchOne uid=${uid} in ${opened}`
+        );
+        if (!m || !m.source) return doc;
 
-        // Try by UID first
-        try {
-            for await (const it of client.fetch(String(uid), { uid: true, source: true, bodyStructure: true })) {
-                const src = (it as any)?.source;
-                bodyStruct = (it as any)?.bodyStructure || null;
-                if (src) {
-                    sourceBuf = Buffer.isBuffer(src)
-                        ? src
-                        : await new Promise<Buffer>((resolve, reject) => {
-                            const chunks: Buffer[] = [];
-                            (src as NodeJS.ReadableStream)
-                                .on("data", (c) => chunks.push(Buffer.from(c)))
-                                .on("end", () => resolve(Buffer.concat(chunks)))
-                                .on("error", reject);
-                        });
-                }
-                break;
-            }
-        } catch {/* fall through to search */}
+        const sourceBuf = await withTimeout(
+            toBuffer(m.source),
+            10_000,
+            `read source stream uid=${uid}`
+        ).catch(() => Buffer.alloc(0));
 
-        // Fallback: if we didn’t get the source (maybe moved folders), search by Message-ID header
-        if (!sourceBuf && doc.msgId) {
-            // Ask for UIDs; result can be number[] or false
-            const searchRes = await client.search(
-                { header: { "message-id": doc.msgId } },
-                { uid: true }
-            );
+        if (!sourceBuf.length) return doc;
 
-            const hits: number[] = Array.isArray(searchRes) ? searchRes : [];
-            if (hits.length > 0) {
-                const hitUid = String(hits[hits.length - 1]); // last occurrence
+        const bodyStructure: any | null = m.bodyStructure ?? null;
 
-                for await (const it of client.fetch(hitUid, { uid: true, source: true, bodyStructure: true })) {
-                    const src = (it as any)?.source;
-                    bodyStruct = bodyStruct || (it as any)?.bodyStructure || null;
+        const parsed = await withTimeout(
+            simpleParser(sourceBuf),
+            15_000,
+            `simpleParser uid=${uid}`
+        );
 
-                    if (src) {
-                        sourceBuf = Buffer.isBuffer(src)
-                            ? src
-                            : await new Promise<Buffer>((resolve, reject) => {
-                                const chunks: Buffer[] = [];
-                                (src as NodeJS.ReadableStream)
-                                    .on("data", (c) => chunks.push(Buffer.from(c)))
-                                    .on("end", () => resolve(Buffer.concat(chunks)))
-                                    .on("error", reject);
-                            });
-                    }
-                    break;
-                }
-
-                // If we found it in the *currently open* mailbox, persist the folder
-                if (sourceBuf && opened && opened !== recordedFolder) {
-                    await messages.updateOne(
-                        { tenantId, threadId, uid },
-                        { $set: { folder: opened } }
-                    );
-                }
-            }
-        }
-
-        if (!sourceBuf) return doc; // nothing we can do
-
-        const parsed = await simpleParser(sourceBuf);
-
+        // Prefer HTML, then textAsHtml, then text
         const html =
             (typeof parsed.html === "string" ? parsed.html : "") ||
             (typeof (parsed as any).textAsHtml === "string" ? (parsed as any).textAsHtml : "");
         const text = typeof parsed.text === "string" ? parsed.text : "";
 
-        const attachments = bodyStruct ? collectAttachments(bodyStruct) : (doc.attachments || []);
+        // Attachment metadata from BODYSTRUCTURE
+        const attachments = bodyStructure
+            ? collectAttachments(bodyStructure)
+            : (doc.attachments || []);
+
+        // Capture inline ICS if present
+        let calendarIcs: string | undefined;
+        if (Array.isArray((parsed as any).attachments)) {
+            const cal = (parsed as any).attachments.find((a: any) =>
+                String(a.contentType || "").toLowerCase().includes("text/calendar")
+            );
+            if (cal?.content) {
+                calendarIcs = (Buffer.isBuffer(cal.content) ? cal.content : Buffer.from(String(cal.content))).toString("utf8");
+            }
+        }
 
         await messages.updateOne(
             { tenantId, threadId, uid },
@@ -149,12 +152,15 @@ export async function ensureFullBody({ tenantId, threadId, uid, force }: EnsureA
                     text: text || undefined,
                     attachments,
                     bodyFetchedAt: new Date(),
+                    ...(calendarIcs ? { calendarIcs } : {}),
                 },
             }
         );
 
-        // return the freshest doc
         return await messages.findOne({ tenantId, threadId, uid });
+    } catch (e) {
+        console.warn("[ensureFullBody] failed (non-fatal)", { threadId, uid, err: String(e) });
+        return doc; // don’t block the pipeline
     } finally {
         try { await client.logout(); } catch {}
     }

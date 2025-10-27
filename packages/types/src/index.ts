@@ -111,6 +111,12 @@ export type Draft = {
     createdAt: Date;
     status: "ready" | "sent" | "discarded";
     inReplyToUid?: number;
+    meta?: {
+        kind?: "meeting";
+        action?: "accept" | "decline" | "propose";
+        reason?: string;
+        proposals?: { start: string; end: string }[];
+    };
 };
 
 export type TenantSettings = {

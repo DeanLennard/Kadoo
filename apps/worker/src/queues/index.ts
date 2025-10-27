@@ -5,12 +5,16 @@ import { ObjectId } from "mongodb";
 import { col } from "../db";
 import type { MailboxConnector, MailThread, MailMessage } from "@kadoo/types";
 import { makeSmtp } from "../adapters/smtp";
-import { appendDraft } from "../adapters/imap-append";
+import { appendDraft, resolveSentMailbox, appendToMailbox } from "../adapters/imap-append";
 import { emit } from "../pub";
 import { checkThreshold } from "../policy/thresholds";
 import { pickSlot } from "../policy/availability";
 import { buildIcs } from "../util/ics";
 import { upsertEvent } from "../adapters/caldav";
+import { buildMixedMime } from "../util/buildMixedMime";
+import { buildIcsReply } from "../util/buildIcsReply";
+import { buildCalendarReplyMime } from "../util/buildCalendarReplyMime";
+import { buildAcceptedEvent } from "../util/buildAcceptedEvent";
 
 export const eventsQueue = new Queue("events", { connection });
 export const decisionsQueue = new Queue("decisions", { connection });
@@ -41,6 +45,15 @@ function buildMime({ from, to, subject, text }: { from: string; to: string[]; su
         ``,
     ].join("\r\n");
     return Buffer.from(headers + mdToPlain(text) + "\r\n");
+}
+
+export async function appendSent(connCfg: MailboxConnector, raw: Buffer) {
+    try {
+        const sentPath = await resolveSentMailbox(connCfg);
+        await appendToMailbox(connCfg, raw, sentPath); // defaults to ["\\Seen"]
+    } catch (e) {
+        console.warn("[imap] append to Sent failed", String(e));
+    }
 }
 
 /**
@@ -119,13 +132,25 @@ export const decisionsWorker = new Worker(
 export const executeWorker = new Worker(
     "execute",
     async (job) => {
+        console.log("[execute] start", job.name, job.id, job.data);
+
         const { tenantId, logId, ...payload } = job.data as any;
+
+        if (!logId) {
+            console.error("[execute] missing logId in job.data", job.data);
+            return;
+        }
 
         const logs = await col("DecisionLog");
         const connectors = await col<MailboxConnector>("MailboxConnector");
         const _id = new ObjectId(logId);
         const doc = await logs.findOne({ _id, tenantId });
-        if (!doc) return;
+        if (!doc) {
+            console.error("[execute] DecisionLog not found", { tenantId, logId });
+            return;
+        }
+
+        console.log("[execute] action.type", doc.action?.type);
 
         switch (doc.action.type) {
             case "create_draft_reply": {
@@ -148,6 +173,202 @@ export const executeWorker = new Worker(
                 await logs.updateOne(
                     { tenantId, "action.payload.threadId": threadId, status: { $in: ["pending", "approved"] } },
                     { $set: { status: "executed", executedAt: new Date(), result: { ok: true, kind: "draft" } } },
+                );
+                return;
+            }
+
+            case "send_reply": {
+                const { tenantId, threadId, to, subject, body_md, body_html } = job.data as any;
+
+                const connectors = await col<MailboxConnector>("MailboxConnector");
+                const conn = await connectors.findOne({ tenantId, type: "imap" });
+                if (!conn) throw new Error("No connector for SMTP sender");
+
+                const from = conn.imap!.user;
+                const mime = buildMixedMime({ from, to, subject, text: body_md, html: body_html });
+
+                const smtp = makeSmtp(conn);
+
+                const withTimeout = <T,>(p: Promise<T>, ms = 20000) =>
+                    Promise.race<T>([
+                        p,
+                        new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`SMTP timeout after ${ms}ms`)), ms)),
+                    ]);
+
+                try {
+                    console.log("[smtp] verify.start");
+                    const ok = await withTimeout(smtp.verify());
+                    console.log("[smtp] verify.ok", ok);
+                } catch (e) {
+                    console.error("[smtp] verify.failed", String(e));
+                    await logs.updateOne(
+                        { _id, tenantId },
+                        { $set: { status: "failed", failReason: "smtp_verify", error: String(e), updatedAt: new Date() } }
+                    );
+                    return;
+                }
+
+                try {
+                    console.log("[smtp] sendMail.start", { to, subject });
+                    const info = await withTimeout(
+                        smtp.sendMail({
+                            raw: mime,                 // full RFC822
+                            envelope: { from, to },    // SMTP MAIL FROM / RCPT TO
+                        }),
+                        25000
+                    );
+
+                    console.log("[smtp] result", {
+                        messageId: info.messageId,
+                        accepted: info.accepted,
+                        rejected: info.rejected,
+                        response: info.response,
+                    });
+
+                    if (!info.accepted || info.accepted.length === 0) {
+                        await logs.updateOne(
+                            { _id, tenantId },
+                            { $set: { status: "failed", failReason: "smtp_rejected", smtp: info, updatedAt: new Date() } }
+                        );
+                        return;
+                    }
+
+                    try {
+                        await appendSent(conn, Buffer.isBuffer(mime) ? mime : Buffer.from(mime));
+                        console.log("[imap] appended to Sent");
+                    } catch (e) {
+                        console.warn("[imap] failed to append to Sent:", String(e));
+                    }
+
+                    await logs.updateOne(
+                        { _id, tenantId },
+                        { $set: { status: "executed", executedAt: new Date(), result: { ok: true, kind: "sent", smtp: info } } }
+                    );
+
+                } catch (e) {
+                    console.error("[smtp] sendMail.failed", String(e));
+                    await logs.updateOne(
+                        { _id, tenantId },
+                        { $set: { status: "failed", failReason: "smtp_send", error: String(e), updatedAt: new Date() } }
+                    );
+                }
+                return;
+            }
+
+            case "send_calendar_reply": {
+                const { tenantId, threadId, to, subject, body_md, body_html, ics_uid, ics_summary, ics_organizer, attendee_email, attendee_name, start, end, location } = job.data as any;
+
+                // load connector (same as other cases)
+                const connectors = await col<MailboxConnector>("MailboxConnector");
+                const conn = await connectors.findOne({ tenantId, type: "imap" });
+                if (!conn) throw new Error("No connector for SMTP sender");
+
+                const from = conn.imap!.user;
+
+                // Build ICS REPLY
+                const ics = buildIcsReply({
+                    uid: ics_uid,
+                    organizerEmail: ics_organizer || to?.[0],
+                    attendeeEmail: attendee_email || from,
+                    attendeeName: attendee_name,
+                    summary: ics_summary,
+                });
+
+                // Build MIME with calendar part
+                const raw = buildCalendarReplyMime({
+                    from,
+                    to,
+                    subject,
+                    text: body_md,
+                    html: body_html,
+                    ics,
+                });
+
+                // SEND
+                const smtp = makeSmtp(conn);
+                const info = await smtp.sendMail({ raw, envelope: { from, to } });
+                console.log("[smtp] calendar reply result", {
+                    messageId: info.messageId,
+                    accepted: info.accepted,
+                    rejected: info.rejected,
+                    response: info.response,
+                });
+
+                // Append to Sent (optional but nice)
+                try {
+                    await appendToMailbox(conn, raw, "Sent");
+                } catch (e) {
+                    console.warn("[imap] append to Sent failed", String(e));
+                }
+
+                // Also ensure *your* calendar has the event (accepted)
+                try {
+                    const calConns = await col("cal_connectors");
+                    const cal = await calConns.findOne({ tenantId, type: "caldav", status: "active" });
+
+                    // ✅ Decrypt your stored password here
+                    const decrypt = (s: string) => /* your real decrypt */ s;
+                    if (cal && ics_uid && start && end) {
+                        const eventIcs = buildAcceptedEvent({
+                            uid: ics_uid,
+                            start,
+                            end,
+                            summary: ics_summary,
+                            organizerEmail: ics_organizer || to?.[0],
+                            attendeeEmail: from,
+                            attendeeName: attendee_name,
+                            location,
+                        });
+
+                        if (cal?.passwordEnc) {
+                            await upsertEvent(
+                                {
+                                    principalUrl: cal.principalUrl,
+                                    calendarUrl: cal.calendarUrl,
+                                    username: cal.username,
+                                    password: decrypt(cal.passwordEnc), // ← must be plaintext
+                                    syncToken: cal.syncToken,
+                                },
+                                eventIcs
+                            );
+                        } else {
+                            throw new Error("Missing CalDAV credentials");
+                        }
+                    }
+
+                } catch (e) {
+                    console.warn("[caldav] upsert accepted event failed", String(e));
+
+                    // Fallback: ensure it's visible in your DB so the UI reflects acceptance
+                    try {
+                        const eventsCol = await col("cal_events");
+                        await eventsCol.updateOne(
+                            { tenantId, uid: ics_uid },
+                            {
+                                $set: {
+                                    tenantId,
+                                    uid: ics_uid,
+                                    start: new Date(start),
+                                    end: new Date(end),
+                                    summary: ics_summary,
+                                    location,
+                                    organizer: ics_organizer,
+                                    attendees: [{ email: from, name: attendee_name, partstat: "ACCEPTED" }],
+                                    source: "local-accept",
+                                    updatedAt: new Date(),
+                                },
+                                $setOnInsert: { createdAt: new Date() },
+                            },
+                            { upsert: true }
+                        );
+                    } catch (dbErr) {
+                        console.warn("[db] fallback insert failed", String(dbErr));
+                    }
+                }
+
+                await logs.updateOne(
+                    { _id, tenantId },
+                    { $set: { status: "executed", executedAt: new Date(), result: { ok: true, kind: "calendar_reply" } } }
                 );
                 return;
             }

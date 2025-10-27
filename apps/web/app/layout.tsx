@@ -33,6 +33,8 @@ export default function RootLayout({
                         </a>
                         <nav className="text-sm">
                             <a className="mr-4 hover:underline" href="/dashboard">Dashboard</a>
+                            <a className="mr-4 hover:underline" href="/inbox">Inbox</a>
+                            <a className="mr-4 hover:underline" href="/calendar">Calendar</a>
                             <a className="hover:underline" href="/approvals">Approvals</a>
                         </nav>
                     </div>

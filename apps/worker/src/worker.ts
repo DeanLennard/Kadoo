@@ -7,8 +7,9 @@ import { classifyMessage } from "./workers/classify";
 import { decideAction } from "./workers/decide";
 import { generateDraft } from "./workers/generateDraft";
 import { ensureFullBody } from "./workers/ensureBody";
-import {resolveSpamMailbox} from "./util/resolveSpamMailbox";
+import { resolveSpamMailbox } from "./util/resolveSpamMailbox";
 import { appendImapDraft } from "./workers/appendImapDraft";
+import { handleInvite } from "./workers/handleInvite";
 
 const LOCK_TTL_MS = 5 * 60 * 1000;
 
@@ -140,6 +141,62 @@ subscribe<IngestJob>(TOPIC_INGEST, async ({ tenantId, threadId, uid }) => {
 
         console.log(`[worker] spam.move.done`);
         return;
+    }
+
+    // Detect a calendar invite via attachments + label
+    const atts: any[] = Array.isArray((msg as any).attachments) ? (msg as any).attachments : [];
+    const hasIcs = atts.some(a => String(a.contentType || "").toLowerCase().includes("text/calendar"));
+    const isCalendar = hasIcs || (facts.labels || []).includes("calendar");
+
+    if (isCalendar) {
+        // Prefer the first ICS attachment
+        const icsAttachment = atts.find(a => String(a.contentType || "").toLowerCase().includes("text/calendar"));
+        let ics: string | undefined =
+            icsAttachment?.content
+                ? (Buffer.isBuffer(icsAttachment.content)
+                    ? icsAttachment.content.toString("utf8")
+                    : String(icsAttachment.content))
+                : undefined;
+
+        // Fallback: ICS captured by ensureFullBody via simpleParser
+        if (!ics && (msg as any).calendarIcs) {
+            ics = String((msg as any).calendarIcs);
+        }
+
+        // If we still don't have ICS, don't invoke the invite handler
+        if (!ics) {
+            console.warn("[worker] calendar email detected but no ICS found; skipping invite handler", {
+                threadId, uid
+            });
+            return;
+        }
+
+        // Load policy (or default)
+        const policies = await col<any>("TenantPolicy");
+        const policy =
+            (await policies.findOne({ tenantId })) ||
+            { workingHours: { start: "09:00", end: "17:30", days: [1,2,3,4,5] }, buffers: { before: 10, after: 10 } };
+
+        // Ensure date is string | number (avoid TS2322)
+        const safeDate =
+            typeof msg.date === "string" || typeof msg.date === "number"
+                ? msg.date
+                : (msg.date instanceof Date ? msg.date.toISOString() : undefined);
+
+        console.log("[worker] invite.handle.start", { threadId, uid, hasIcs: !!ics });
+
+        const decision = await handleInvite({
+            tenantId,
+            threadId,
+            uid,
+            ics,
+            msg: { subject: threadSubject, from: msg.from, date: safeDate },
+            policy,
+            tz: "Europe/London",
+        });
+
+        console.log("[worker] invite.handle.done", decision);
+        return; // Skip generic reply flow
     }
 
     // 3) decision (reply/no-op)

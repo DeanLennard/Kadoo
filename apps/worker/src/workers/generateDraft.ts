@@ -1,6 +1,8 @@
 // apps/worker/src/workers/generateDraft.ts
 import { openai } from "../llm";
 import type { MailMessage, Draft, TenantSettings } from "@kadoo/types";
+import { buildSignatures, applySignature, looksSigned, stripHtml, escapeHtml } from "../util/signature";
+import {col} from "../db";
 
 type GenerateArgs = {
     tenantId: string;
@@ -25,15 +27,36 @@ function inferConfidence(
     return hadBody ? 0.75 : 0.55;
 }
 
-// naive detector to avoid double-signing if model already added a closing
-function looksSigned(s: string): boolean {
-    const tail = s.trim().slice(-200).toLowerCase();
-    return /\b(best|kind|warm|many|thanks|regards)\b[\s,]*\n/.test(tail) ||
-        /\b(best|kind|warm|many|thanks)\b[\s,]*<br\/?>/i.test(tail);
+function normalizeAddresses(val: any): string[] {
+    if (!val) return [];
+    if (typeof val === "string") return [val];
+    if (Array.isArray(val)) {
+        // could be strings or { address, name }
+        return val
+            .map((v) => {
+                if (!v) return null;
+                if (typeof v === "string") return v;
+                if (typeof v === "object" && v.address) return String(v.address);
+                return null;
+            })
+            .filter(Boolean) as string[];
+    }
+    if (typeof val === "object" && val.address) return [String(val.address)];
+    return [];
+}
+
+function safeIsoDate(d: unknown): string {
+    if (typeof d === "string") return d;
+    if (typeof d === "number") return new Date(d).toISOString();
+    if (d instanceof Date) return d.toISOString();
+    return new Date().toISOString();
 }
 
 export async function generateDraft(args: GenerateArgs): Promise<Draft> {
     const { tenantId, threadId, uidRef, msg, subject, settings } = args;
+
+    const toList = normalizeAddresses((msg as any).to);
+    const dateIso = safeIsoDate((msg as any).date);
 
     const replySubject = subject?.toLowerCase().startsWith("re:") ? subject : `Re: ${subject || ""}`;
 
@@ -52,8 +75,8 @@ Add a bullet list only if it materially improves clarity.
 Original:
 Subject: ${subject || "(no subject)"}
 From: ${msg.from}
-To: ${(msg.to || []).join(", ")}
-Date: ${new Date(msg.date || Date.now()).toISOString()}
+To: ${toList.join(", ")}
+Date: ${dateIso}
 
 Plain:
 ${msg.text || ""}
@@ -84,53 +107,16 @@ If appropriate, include a brief subject tweak (<=65 chars). Return as JSON:
 
     if (!parsed.html && !parsed.text) parsed.text = "[NO_DRAFT]";
 
-    // --- Build sign-off ---
-    const senderName = settings.senderName?.trim();
-    const companyName = settings.companyName?.trim();
+    const sigs = buildSignatures({
+        senderName: settings.senderName,
+        companyName: settings.companyName,
+        signatureHtml: settings.signatureHtml,
+    });
 
-    const htmlSignature =
-        settings.signatureHtml?.trim() ||
-        (senderName
-            ? [
-                "<br><br>",
-                "Best regards,",
-                "<br/>",
-                `<strong>${escapeHtml(senderName)}</strong>`,
-                companyName ? `<br/>${escapeHtml(companyName)}` : "",
-            ].join("")
-            : "");
-
-    const textSignature =
-        senderName
-            ? [
-                "",
-                "",
-                "Best regards,",
-                senderName,
-                companyName ? companyName : "",
-            ].join("\n")
-            : "";
-
-    // Avoid double-signing if the model already signed
-    let html = parsed.html || "";
-    let text = parsed.text || "";
-
-    const isNoDraft = /^\s*\[NO_DRAFT\]\s*$/.test(text) || /^\s*\[NO_DRAFT\]\s*$/.test(html);
-
-    if (!isNoDraft) {
-        if (html) {
-            const bareHtml = html.replace(/\s+$/g, "");
-            if (!looksSigned(stripHtml(bareHtml)) && htmlSignature) {
-                html = `${bareHtml}${htmlSignature}`;
-            }
-        }
-        if (text) {
-            const bareText = text.replace(/\s+$/g, "");
-            if (!looksSigned(bareText) && textSignature) {
-                text = `${bareText}${textSignature ? `\n${textSignature}` : ""}`;
-            }
-        }
-    }
+    const signed = applySignature(
+        { text: parsed.text, html: parsed.html },
+        sigs
+    );
 
     const draft: Draft = {
         _id: `${threadId}:${uidRef}:draft:${Date.now()}`,
@@ -141,22 +127,11 @@ If appropriate, include a brief subject tweak (<=65 chars). Return as JSON:
         needsApproval: true,
         inReplyToUid: uidRef,
         subject: parsed.subject || replySubject,
-        text,
-        html,
+        text: signed.text || "",
+        html: signed.html,
         createdAt: new Date(),
         status: "ready",
     };
 
     return draft;
-}
-
-// --- small helpers ---
-function stripHtml(s: string): string {
-    return s.replace(/<[^>]+>/g, "").replace(/&nbsp;/g, " ").trim();
-}
-function escapeHtml(s: string): string {
-    return s
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
 }
