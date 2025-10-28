@@ -115,3 +115,42 @@ export type CalEvent = {
     rawIcs: string;
     updatedAt: Date;
 };
+
+export type Employee = {
+    _id: string;
+    tenantId: string;
+    name: string;
+    email?: string;
+    role: "ea" | "agent" | "bot";
+    enabled: boolean;
+
+    permissions: {
+        canSendEmails: boolean;
+        canProposeTimes: boolean;
+        canAcceptInvites: boolean;
+        canDeclineInvites: boolean;
+        canScheduleMeetings: boolean;
+    };
+
+    auto: {
+        // which actions can run without approval
+        sendWithoutApproval: {
+            send_reply: boolean;
+            send_calendar_reply: boolean;
+            schedule_meeting: boolean;
+        };
+        // model confidence thresholds (0..1) required to auto-execute
+        thresholds: {
+            send_reply: number;          // e.g. 0.90
+            send_calendar_reply: number; // e.g. 0.85
+            schedule_meeting: number;    // e.g. 0.92
+        };
+    };
+
+    limits?: {
+        dailySends?: number; // optional quota
+    };
+
+    createdAt: Date;
+    updatedAt: Date;
+};
