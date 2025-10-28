@@ -14,6 +14,17 @@ export const Tenant = z.object({
     })
 });
 
+export type EmployeeActionLog = {
+    _id: string;                // ObjectId
+    tenantId: string;
+    ts: Date;
+    employeeId?: string;        // "ea-1" etc.
+    action: "send_reply" | "create_draft_reply" | "schedule_meeting" | "send_calendar_reply" | string;
+    threadId?: string;
+    cost: number;               // credits charged (>=0)
+    meta?: Record<string, any>; // any context (smtp ids, durations, etc.)
+};
+
 export const Decision = z.object({
     policyVersion: z.literal("v1"),
     confidence: z.number(),

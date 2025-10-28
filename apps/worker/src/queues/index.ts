@@ -15,6 +15,7 @@ import { buildMixedMime } from "../util/buildMixedMime";
 import { buildIcsReply } from "../util/buildIcsReply";
 import { buildCalendarReplyMime } from "../util/buildCalendarReplyMime";
 import { buildAcceptedEvent } from "../util/buildAcceptedEvent";
+import { spendCreditsAndLog } from "../util/credits";
 
 export const eventsQueue = new Queue("events", { connection });
 export const decisionsQueue = new Queue("decisions", { connection });
@@ -174,6 +175,7 @@ export const executeWorker = new Worker(
                     { tenantId, "action.payload.threadId": threadId, status: { $in: ["pending", "approved"] } },
                     { $set: { status: "executed", executedAt: new Date(), result: { ok: true, kind: "draft" } } },
                 );
+                await spendCreditsAndLog({ tenantId, cost: 2, action: "create_draft_reply", threadId });
                 return;
             }
 
@@ -244,6 +246,20 @@ export const executeWorker = new Worker(
                         { _id, tenantId },
                         { $set: { status: "executed", executedAt: new Date(), result: { ok: true, kind: "sent", smtp: info } } }
                     );
+
+                    try {
+                        const newBal = await spendCreditsAndLog({
+                            tenantId,
+                            cost: 5,
+                            action: "send_reply",
+                            threadId,
+                            meta: { messageId: info.messageId, accepted: info.accepted }
+                        });
+                        // (Optional) emit an SSE event so the dashboard updates live
+                        await emit(tenantId, { kind: "credits_update", balance: newBal, delta: -5 });
+                    } catch (e) {
+                        console.warn("[credits] spend/log failed", String(e));
+                    }
 
                 } catch (e) {
                     console.error("[smtp] sendMail.failed", String(e));
@@ -370,6 +386,10 @@ export const executeWorker = new Worker(
                     { _id, tenantId },
                     { $set: { status: "executed", executedAt: new Date(), result: { ok: true, kind: "calendar_reply" } } }
                 );
+                await spendCreditsAndLog({
+                    tenantId, cost: 5, action: "send_calendar_reply", threadId,
+                    meta: { calendar: true }
+                });
                 return;
             }
 
@@ -470,6 +490,11 @@ export const executeWorker = new Worker(
                         },
                     }
                 );
+
+                await spendCreditsAndLog({
+                    tenantId, cost: 10, action: "schedule_meeting",
+                    meta: { href, slot }
+                });
 
                 await emit(tenantId, {
                     kind: "meeting_scheduled",

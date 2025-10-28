@@ -24,6 +24,12 @@ export interface Tenant {
     name: string;
     region: "UK" | "EU";
     createdAt: Date;
+    credits: {
+        balance: number;
+        planMonthlyAllotment: number;
+        resetDay: number;
+        lastResetAt?: Date;
+    };
 }
 
 export interface User {
