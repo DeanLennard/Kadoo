@@ -2,9 +2,9 @@
 import type { TenantSettings, Draft } from "@kadoo/types";
 import { col } from "../db";
 import { parseIcs } from "../adapters/caldav";
-import { appendImapDraft } from "./appendImapDraft";
-import { executeQueue } from "../queues";
+import { decisionsQueue } from "../queues";
 import { buildSignatures, applySignature } from "../util/signature";
+import { getActiveEA, canAcceptInvites } from "../util/employee";
 
 type ISO = string;
 type BusyBlock = { start: string | Date; end: string | Date; summary?: string };
@@ -162,6 +162,9 @@ export async function handleInvite({
     if (!ics) throw new Error("handleInvite called without ICS");
     const invite = parseIcs(ics); // returns Dates for start/end (per your existing code)
 
+    const emp = await getActiveEA(tenantId);
+    const eaHasPermission = canAcceptInvites(emp);
+
     // gather same-day busy blocks from DB
     const eventsCol = await col<any>("cal_events");
     const dayStart = new Date(invite.start); dayStart.setHours(0, 0, 0, 0);
@@ -176,166 +179,126 @@ export async function handleInvite({
     const inviteObj = { start: invite.start, end: invite.end };
     const allowed = isAllowedInvite(inviteObj, busy, policy);
 
-    let decision:
-        | { action: "accept"; reason: string; confidence: number; draft: { subject: string; text: string; html?: string } }
-        | { action: "propose"; reason: string; confidence: number; proposals: Array<{ start: ISO; end: ISO }>; draft: { subject: string; text: string; html?: string } };
+    let confidence = allowed ? 0.98 : 0.90;
+    const whenStr = `${invite.start.toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})}–${invite.end.toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})} on ${invite.start.toLocaleDateString("en-GB")}`;
 
-    if (allowed) {
-        const whenStr = `${invite.start.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })}–${invite.end.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })} on ${invite.start.toLocaleDateString("en-GB")}`;
-        const text = `Thanks for the invitation — ${whenStr} works for me.`;
-        decision = {
-            action: "accept",
-            reason: "No overlap, within working hours and notice.",
-            confidence: 0.98,
-            draft: {
-                subject: msg.subject?.startsWith("Re:") ? msg.subject! : `Re: ${msg.subject ?? invite.summary ?? "Meeting"}`,
-                text,
-                html: `<p>${text}</p>`,
-            },
-        };
-    } else {
-        const proposals = computeProposals({
-            inviteStart: invite.start,
-            inviteEnd: invite.end,
-            busy,
-            policy,
-            max: 3,
-        });
-
-        // If no proposals, still generate a polite fallback propose text
-        const fmt = (iso: string) => {
-            const d = new Date(iso);
-            return `${d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })} on ${d.toLocaleDateString("en-GB")}`;
-        };
-        const text =
-            proposals.length
-                ? `Thanks for the invitation. I can’t make the proposed time, but these would work for me:\n\n• ${fmt(proposals[0].start)}\n${proposals[1] ? `• ${fmt(proposals[1].start)}\n` : ""}${proposals[2] ? `• ${fmt(proposals[2].start)}\n` : ""}\nPlease let me know if any of these suit.`
-                : `Thanks for the invitation. I can’t make the proposed time — could you share a couple of alternative slots later that day or the next, and I’ll confirm?`;
-
-        decision = {
-            action: "propose",
-            reason: "Conflicts with policy (overlap/buffer/working-hours/notice).",
-            confidence: 0.9,
-            proposals,
-            draft: {
-                subject: msg.subject?.startsWith("Re:") ? msg.subject! : `Re: ${msg.subject ?? invite.summary ?? "Meeting"}`,
-                text,
-                html: `<p>${text.replace(/\n/g, "<br/>")}</p>`,
-            },
-        };
-    }
-
-    // ---- Sign + persist/execute exactly like before ----
     const settingsCol = await col<TenantSettings>("TenantSettings");
-    const settings =
-        (await settingsCol.findOne({ tenantId })) ||
-        ({ tenantId, autoDraft: true, autoSend: false } as TenantSettings);
-
+    const settings = (await settingsCol.findOne({ tenantId })) || ({ tenantId, autoDraft: true, autoSend: false } as TenantSettings);
     const sigs = buildSignatures({
         senderName: (settings as any).senderName,
         companyName: (settings as any).companyName,
         signatureHtml: (settings as any).signatureHtml,
     });
 
-    const signed = applySignature({ text: decision.draft.text, html: decision.draft.html }, sigs);
+    const subject = msg.subject?.startsWith("Re:") ? msg.subject! : `Re: ${msg.subject ?? invite.summary ?? "Meeting"}`;
 
-    const draft: Draft = {
-        _id: `${threadId}:${uid}:meeting:${Date.now()}`,
-        tenantId,
-        threadId,
-        uidRef: uid,
-        confidence: decision.confidence ?? 0.7,
-        needsApproval: true,
-        inReplyToUid: uid,
-        subject: decision.draft.subject || (msg.subject?.startsWith("Re:") ? msg.subject! : `Re: ${msg.subject ?? ""}`),
-        text: signed.text,
-        html: signed.html ?? undefined,
-        createdAt: new Date(),
-        status: "ready",
-        meta: {
-            kind: "meeting",
-            action: decision.action,
-            reason: decision.reason,
-            proposals: (decision as any).proposals ?? [],
-        } as any,
-    };
-
-    const autoThreshold = policy?.autoExecuteThreshold ?? 0.88;
-    const shouldAuto = (decision.confidence ?? 0) >= autoThreshold;
-    const canAuto = decision.action === "accept" || decision.action === "propose";
-
-    if (shouldAuto && decision.action === "accept") {
-        const logs = await col("DecisionLog");
-        const { insertedId } = await logs.insertOne({
-            tenantId,
-            createdAt: new Date(),
-            status: "approved",
-            requiresApproval: false,
-            confidence: decision.confidence,
-            action: {
-                type: "send_calendar_reply",
-                payload: {
-                    threadId,
-                    to: [msg.from].filter(Boolean),
-                    subject: draft.subject,
-                    body_md: signed.text,
-                    body_html: signed.html ?? undefined,
-                    // ICS context
-                    ics_uid: invite.uid,                   // make sure parseIcs() exposes this
-                    ics_summary: invite.summary,
-                    ics_organizer: invite.organizer,
-                    attendee_email: /* your mailbox address will be derived in execute */ undefined,
-                    attendee_name: (settings as any).senderName,
-                    start: invite.start.toISOString(),
-                    end: invite.end.toISOString(),
-                    location: invite.location,
-                },
-            },
-            context: { invite, busy, policy },
-        });
-
-        await executeQueue.add(
-            "send_calendar_reply",
-            {
-                tenantId,
-                logId: insertedId.toHexString(),
-                threadId,
-                to: [msg.from].filter(Boolean),
-                subject: draft.subject,
-                body_md: signed.text,
-                body_html: signed.html ?? undefined,
-                ics_uid: invite.uid,
-                ics_summary: invite.summary,
-                ics_organizer: invite.organizer,
-                start: invite.start.toISOString(),
-                end: invite.end.toISOString(),
-                location: invite.location,
-                attendee_name: (settings as any).senderName,
-            },
-            { removeOnComplete: true, attempts: 3, backoff: { type: "exponential", delay: 1000 } }
-        );
-
-        return decision;
+    if (!emp?.enabled) {
+        // Optionally emit an SSE so the dashboard shows that we ignored it
+        // await emit(tenantId, { kind: "action_denied", reason: "ea_disabled_or_no_permission", action: "send_calendar_reply" });
+        return { action: "accept", confidence, queued: "ignored_ea_off" } as const;
     }
 
-    await (await col<Draft>("Draft")).insertOne(draft);
-    await appendImapDraft({ tenantId, threadId, uidRef: uid, draft });
+    if (allowed) {
+        const text = `Thanks for the invitation — ${whenStr} works for me.`;
+        const signed = applySignature({ text, html: `<p>${text}</p>` }, sigs);
 
+        // If EA missing/disabled/no permission → create PENDING decision log and stop
+        if (!eaHasPermission) {
+            await (await col("DecisionLog")).insertOne({
+                tenantId,
+                createdAt: new Date(),
+                status: "pending",
+                requiresApproval: true,
+                confidence,
+                reason: !emp ? "ea_missing" : "ea_disabled_or_no_permission",
+                action: {
+                    type: "send_calendar_reply",
+                    payload: {
+                        threadId,
+                        to: [msg.from].filter(Boolean),
+                        subject,
+                        body_md: signed.text,
+                        body_html: signed.html,
+                        ics_uid: invite.uid,
+                        ics_summary: invite.summary,
+                        ics_organizer: invite.organizer,
+                        start: invite.start.toISOString(),
+                        end: invite.end.toISOString(),
+                        location: invite.location,
+                        attendee_name: (settings as any).senderName,
+                    },
+                },
+                context: { invite, busy, policy },
+            });
+            return { action: "accept", confidence, queued: "pending_decision" } as const;
+        }
+
+        // Else: enqueue a decision; decisionsWorker will honour auto flags/thresholds and either approve+execute or leave pending.
+        await decisionsQueue.add(
+            "plan",
+            {
+                tenantId,
+                threadId,
+                decision: {
+                    actionType: "send_calendar_reply" as const,
+                    confidence,
+                    payload: {
+                        to: [msg.from].filter(Boolean),
+                        subject,
+                        body_md: signed.text,
+                        body_html: signed.html,
+                        ics_uid: invite.uid,
+                        ics_summary: invite.summary,
+                        ics_organizer: invite.organizer,
+                        start: invite.start.toISOString(),
+                        end: invite.end.toISOString(),
+                        location: invite.location,
+                        attendee_name: (settings as any).senderName,
+                    },
+                },
+            },
+            { removeOnComplete: true, removeOnFail: 50 }
+        );
+
+        return { action: "accept", confidence, queued: "decisions" } as const;
+    }
+
+    // PROPOSE path
+    const proposals = computeProposals({
+        inviteStart: invite.start,
+        inviteEnd: invite.end,
+        busy,
+        policy,
+        max: 3,
+    });
+
+    const fmt = (iso: string) => {
+        const d = new Date(iso);
+        return `${d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })} on ${d.toLocaleDateString("en-GB")}`;
+    };
+    const list = proposals.map(p => `• ${fmt(p.start)}`).join("\n");
+    const text = proposals.length
+        ? `Thanks for the invitation. I can’t make the proposed time, but these would work for me:\n\n${list}\nPlease let me know if any of these suit.`
+        : `Thanks for the invitation. I can’t make the proposed time — could you share a couple of alternative slots later that day or the next, and I’ll confirm?`;
+
+    const signed = applySignature({ text, html: `<p>${text.replace(/\n/g, "<br/>")}</p>` }, sigs);
+
+    // For proposals we create a *draft reply* decision. DO NOT append IMAP draft here.
     await (await col("DecisionLog")).insertOne({
         tenantId,
         createdAt: new Date(),
         status: "pending",
         requiresApproval: true,
-        confidence: decision.confidence,
+        confidence,
         action: {
             type: "create_draft_reply",
             payload: {
                 threadId,
                 to: [msg.from].filter(Boolean),
-                subject: draft.subject,
+                subject,
                 body_md: signed.text,
-                proposals: (decision as any).proposals ?? [],
-                meetingIntent: decision.action, // "accept" | "decline" | "propose"
+                meetingIntent: "propose",
+                proposals,
             },
         },
         context: {
@@ -352,5 +315,8 @@ export async function handleInvite({
         },
     });
 
-    return decision as any;
+    // (Optional) If you prefer the decisions pipeline to decide auto-draft vs pending:
+    // await decisionsQueue.add("plan", { tenantId, threadId, decision: { actionType: "send_reply", confidence, payload: {...} } });
+
+    return { action: "propose", confidence, queued: "pending_decision" } as const;
 }

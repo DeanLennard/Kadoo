@@ -5,11 +5,22 @@ import { createImapClient } from "./runners/imapClient";
 import type { MailMessage, MailThread, MailboxConnector, Draft, TenantSettings } from "@kadoo/types";
 import { classifyMessage } from "./workers/classify";
 import { decideAction } from "./workers/decide";
-import { generateDraft } from "./workers/generateDraft";
 import { ensureFullBody } from "./workers/ensureBody";
 import { resolveSpamMailbox } from "./util/resolveSpamMailbox";
-import { appendImapDraft } from "./workers/appendImapDraft";
 import { handleInvite } from "./workers/handleInvite";
+import {decisionsQueue} from "./queues";
+
+type DraftDecision = {
+    kind: "draft";
+    subject?: string;
+    text?: string;   // markdown/plain
+    html?: string;   // optional html
+    confidence?: number;
+};
+
+type NoneDecision = { kind: "none" };
+
+type DecideActionResult = DraftDecision | NoneDecision;
 
 const LOCK_TTL_MS = 5 * 60 * 1000;
 
@@ -201,33 +212,73 @@ subscribe<IngestJob>(TOPIC_INGEST, async ({ tenantId, threadId, uid }) => {
 
     // 3) decision (reply/no-op)
     console.log(`[worker] decide.start`);
-    const decision = decideAction({ msg: { ...msg, ...facts }, subject: threadSubject, settings });
+    const decision = decideAction({
+        msg: { ...msg, ...facts },
+        subject: threadSubject,
+        settings,
+    }) as DecideActionResult;
     console.log(`[worker] decide.done`, decision);
 
     if (decision.kind === "draft") {
-        console.log(`[worker] generateDraft.start`);
-        const draft = await generateDraft({
-            tenantId, threadId, uidRef: uid,
-            msg: { ...msg, ...facts },
-            subject: threadSubject,
-            settings
-        });
+        // Gate by EA status/permissions BEFORE doing anything
+        const Employees = await col("Employee");
+        const ea = await Employees.findOne({ tenantId, role: "ea" });
+        const eaEnabled = !!ea?.enabled;
+        const canSend = !!ea?.permissions?.canSendEmails;
 
-        const drafts = await col<Draft>("Draft");
-        await drafts.insertOne(draft);
-        await messages.updateOne({ tenantId, threadId, uid }, { $set: { autoDraftId: draft._id } });
-        console.log(`[worker] generateDraft.inserted`, { draftId: draft._id });
-
-        const imapInfo = await appendImapDraft({ tenantId, threadId, uidRef: uid, draft });
-        if (imapInfo) {
-            console.log("[worker] imap draft appended", imapInfo);
+        // If EA is off or cannot send emails → do nothing (or log)
+        if (!eaEnabled || !canSend) {
+            // Optional: surface to UI
+            // await emit(tenantId, { kind: "action_denied", reason: !eaEnabled ? "ea_disabled" : "permission_denied", action: "create_draft_reply", threadId });
+            return; // hard stop: no draft, no decision log, no credits
         }
 
-        // (Optional) store to IMAP Drafts so clients can see it
-        // appendDraftToImap(conn, draft.html/text)
+        if (!canSend) {
+            // Optional: log a denied decision so the dashboard shows why nothing happened
+            await (await col("DecisionLog")).insertOne({
+                tenantId,
+                createdAt: new Date(),
+                status: "pending",
+                requiresApproval: true,
+                confidence: decision.confidence ?? 0.9,
+                reason: !eaEnabled ? "ea_disabled" : "permission_denied",
+                action: {
+                    type: "create_draft_reply",
+                    payload: {
+                        threadId,
+                        to: [msg.from].filter(Boolean),
+                        subject: decision.subject ?? threadSubject,
+                        body_md: decision.text ?? "Thanks for your message.",
+                    },
+                },
+                context: { labels: facts.labels, priority: facts.priority },
+            });
+            return; // hard stop
+        }
 
-        // TODO: notify user in-app (badge or inbox “Drafts ready”)
+        // EA on: send through the decisions pipeline (no direct IMAP append)
+        await decisionsQueue.add(
+            "plan",
+            {
+                tenantId,
+                threadId,
+                decision: {
+                    actionType: "send_reply",             // let decisionsWorker map this as needed
+                    confidence: decision.confidence ?? 0.9,
+                    payload: {
+                        to: [msg.from].filter(Boolean),
+                        subject: decision.subject ?? threadSubject,
+                        body_md: decision.text ?? "Thanks for your message.",
+                        body_html: decision.html,      // if you have it
+                    },
+                },
+            },
+            { removeOnComplete: true, removeOnFail: 50 }
+        );
+
+        return; // IMPORTANT: do not fall through to any old paths
     }
+
 
     // if decision.kind === 'none' do nothing
 });
