@@ -194,16 +194,19 @@ export const decisionsWorker = new Worker(
         const allowAuto = canAutoExecute(emp, inferredType);
         const permissionOk = hasPermission(emp, inferredType);
 
-        const requiresApproval = !(permissionOk && allowAuto && confidence >= minThreshold);
+        const eaOff = !emp || !emp.enabled;
+
+        const requiresApproval = eaOff || !(permissionOk && allowAuto && confidence >= minThreshold);
 
         const logs = await col("DecisionLog");
         const { insertedId } = await logs.insertOne({
             tenantId,
-            employeeId: emp?._id ?? "ea-default",
+            employeeId: emp?._id ?? "ea-disabled",
             createdAt: new Date(),
             status: requiresApproval ? "pending" : "approved",
             requiresApproval,
             confidence,
+            reason: eaOff ? "ea_disabled_or_missing" : undefined,
             action,
         });
 
@@ -249,9 +252,18 @@ export const executeWorker = new Worker(
 
         const emp = await getActiveEA(tenantId);
 
-        function guardOrDeny(actionType: "send_reply" | "send_calendar_reply" | "schedule_meeting" | "create_draft_reply") {
-            if (!hasPermission(emp, actionType)) {
-                return { ok: false, reason: "permission_denied" as const };
+        function guardOrDeny(
+            actionType: "send_reply" | "send_calendar_reply" | "schedule_meeting" | "create_draft_reply"
+        ) {
+            if (!emp) {
+                return { ok: false as const, reason: "ea_missing" as const };
+            }
+            if (!emp.enabled) {
+                return { ok: false as const, reason: "ea_disabled" as const };
+            }
+            const key = actionToPermissionKey(actionType);
+            if (key && !emp.permissions?.[key]) {
+                return { ok: false as const, reason: "permission_denied" as const };
             }
             return { ok: true as const };
         }
@@ -268,6 +280,14 @@ export const executeWorker = new Worker(
                         { _id, tenantId },
                         { $set: { status: "denied", deniedReason: g.reason, updatedAt: new Date() } }
                     );
+
+                    await emit(tenantId, {
+                        kind: "action_denied",
+                        logId: _id.toString(),
+                        reason: g.reason,
+                        action: doc.action.type,
+                    });
+
                     return;
                 }
 
@@ -299,6 +319,14 @@ export const executeWorker = new Worker(
                         { _id, tenantId },
                         { $set: { status: "denied", deniedReason: g.reason, updatedAt: new Date() } }
                     );
+
+                    await emit(tenantId, {
+                        kind: "action_denied",
+                        logId: _id.toString(),
+                        reason: g.reason,
+                        action: doc.action.type,
+                    });
+
                     return;
                 }
 
@@ -400,6 +428,14 @@ export const executeWorker = new Worker(
                         { _id, tenantId },
                         { $set: { status: "denied", deniedReason: g.reason, updatedAt: new Date() } }
                     );
+
+                    await emit(tenantId, {
+                        kind: "action_denied",
+                        logId: _id.toString(),
+                        reason: g.reason,
+                        action: doc.action.type,
+                    });
+
                     return;
                 }
 
@@ -529,6 +565,14 @@ export const executeWorker = new Worker(
                         { _id, tenantId },
                         { $set: { status: "denied", deniedReason: g.reason, updatedAt: new Date() } }
                     );
+
+                    await emit(tenantId, {
+                        kind: "action_denied",
+                        logId: _id.toString(),
+                        reason: g.reason,
+                        action: doc.action.type,
+                    });
+
                     return;
                 }
 
