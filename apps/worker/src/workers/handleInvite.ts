@@ -4,7 +4,7 @@ import { col } from "../db";
 import { parseIcs } from "../adapters/caldav";
 import { decisionsQueue } from "../queues";
 import { buildSignatures, applySignature } from "../util/signature";
-import { getActiveEA, canAcceptInvites } from "../util/employee";
+import { getActiveEA, hasPermission } from "../util/employee";
 
 type ISO = string;
 type BusyBlock = { start: string | Date; end: string | Date; summary?: string };
@@ -161,9 +161,7 @@ export async function handleInvite({
 
     if (!ics) throw new Error("handleInvite called without ICS");
     const invite = parseIcs(ics); // returns Dates for start/end (per your existing code)
-
     const emp = await getActiveEA(tenantId);
-    const eaHasPermission = canAcceptInvites(emp);
 
     // gather same-day busy blocks from DB
     const eventsCol = await col<any>("cal_events");
@@ -202,15 +200,21 @@ export async function handleInvite({
         const text = `Thanks for the invitation — ${whenStr} works for me.`;
         const signed = applySignature({ text, html: `<p>${text}</p>` }, sigs);
 
-        // If EA missing/disabled/no permission → create PENDING decision log and stop
-        if (!eaHasPermission) {
+        // 1) EA disabled → ignore entirely
+        if (!emp?.enabled) {
+            // optional: await emit(tenantId, { kind: "action_denied", reason: "ea_disabled", action: "send_calendar_reply", threadId });
+            return { action: "accept", confidence, queued: "ignored_ea_off" } as const;
+        }
+
+        // 2) EA enabled but cannot accept invites → create PENDING approval decision
+        if (!hasPermission(emp, "send_calendar_reply")) {
             await (await col("DecisionLog")).insertOne({
                 tenantId,
                 createdAt: new Date(),
                 status: "pending",
                 requiresApproval: true,
                 confidence,
-                reason: !emp ? "ea_missing" : "ea_disabled_or_no_permission",
+                reason: "permission_denied",
                 action: {
                     type: "send_calendar_reply",
                     payload: {
@@ -233,14 +237,14 @@ export async function handleInvite({
             return { action: "accept", confidence, queued: "pending_decision" } as const;
         }
 
-        // Else: enqueue a decision; decisionsWorker will honour auto flags/thresholds and either approve+execute or leave pending.
+        // 3) EA enabled + permission OK → push to decisions (auto vs pending handled there)
         await decisionsQueue.add(
             "plan",
             {
                 tenantId,
                 threadId,
                 decision: {
-                    actionType: "send_calendar_reply" as const,
+                    actionType: "send_calendar_reply",
                     confidence,
                     payload: {
                         to: [msg.from].filter(Boolean),
@@ -259,7 +263,6 @@ export async function handleInvite({
             },
             { removeOnComplete: true, removeOnFail: 50 }
         );
-
         return { action: "accept", confidence, queued: "decisions" } as const;
     }
 

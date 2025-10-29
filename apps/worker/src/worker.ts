@@ -9,6 +9,7 @@ import { ensureFullBody } from "./workers/ensureBody";
 import { resolveSpamMailbox } from "./util/resolveSpamMailbox";
 import { handleInvite } from "./workers/handleInvite";
 import {decisionsQueue} from "./queues";
+import { getActiveEA, hasPermission } from "./util/employee";
 
 type DraftDecision = {
     kind: "draft";
@@ -220,28 +221,23 @@ subscribe<IngestJob>(TOPIC_INGEST, async ({ tenantId, threadId, uid }) => {
     console.log(`[worker] decide.done`, decision);
 
     if (decision.kind === "draft") {
-        // Gate by EA status/permissions BEFORE doing anything
-        const Employees = await col("Employee");
-        const ea = await Employees.findOne({ tenantId, role: "ea" });
-        const eaEnabled = !!ea?.enabled;
-        const canSend = !!ea?.permissions?.canSendEmails;
+        const ea = await getActiveEA(tenantId);
 
-        // If EA is off or cannot send emails → do nothing (or log)
-        if (!eaEnabled || !canSend) {
-            // Optional: surface to UI
-            // await emit(tenantId, { kind: "action_denied", reason: !eaEnabled ? "ea_disabled" : "permission_denied", action: "create_draft_reply", threadId });
-            return; // hard stop: no draft, no decision log, no credits
+        // 1) EA disabled → ignore
+        if (!ea?.enabled) {
+            // optional: await emit(tenantId, { kind: "action_denied", reason: "ea_disabled", action: "create_draft_reply", threadId });
+            return;
         }
 
-        if (!canSend) {
-            // Optional: log a denied decision so the dashboard shows why nothing happened
+        // 2) EA enabled but cannot send → create PENDING approval decision (no IMAP append)
+        if (!hasPermission(ea, "send_reply")) {
             await (await col("DecisionLog")).insertOne({
                 tenantId,
                 createdAt: new Date(),
                 status: "pending",
                 requiresApproval: true,
                 confidence: decision.confidence ?? 0.9,
-                reason: !eaEnabled ? "ea_disabled" : "permission_denied",
+                reason: "permission_denied",
                 action: {
                     type: "create_draft_reply",
                     payload: {
@@ -249,34 +245,35 @@ subscribe<IngestJob>(TOPIC_INGEST, async ({ tenantId, threadId, uid }) => {
                         to: [msg.from].filter(Boolean),
                         subject: decision.subject ?? threadSubject,
                         body_md: decision.text ?? "Thanks for your message.",
+                        body_html: decision.html,
                     },
                 },
                 context: { labels: facts.labels, priority: facts.priority },
             });
-            return; // hard stop
+            return;
         }
 
-        // EA on: send through the decisions pipeline (no direct IMAP append)
+        // 3) EA enabled + permission OK → push to decisions (it will auto-exec or remain pending)
         await decisionsQueue.add(
             "plan",
             {
                 tenantId,
                 threadId,
                 decision: {
-                    actionType: "send_reply",             // let decisionsWorker map this as needed
+                    actionType: "send_reply",
                     confidence: decision.confidence ?? 0.9,
                     payload: {
                         to: [msg.from].filter(Boolean),
                         subject: decision.subject ?? threadSubject,
                         body_md: decision.text ?? "Thanks for your message.",
-                        body_html: decision.html,      // if you have it
+                        body_html: decision.html,
                     },
                 },
             },
             { removeOnComplete: true, removeOnFail: 50 }
         );
 
-        return; // IMPORTANT: do not fall through to any old paths
+        return;
     }
 
 

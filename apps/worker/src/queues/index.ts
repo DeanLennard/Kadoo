@@ -16,6 +16,7 @@ import { buildIcsReply } from "../util/buildIcsReply";
 import { buildCalendarReplyMime } from "../util/buildCalendarReplyMime";
 import { buildAcceptedEvent } from "../util/buildAcceptedEvent";
 import { spendCreditsAndLog } from "../util/credits";
+import { getActiveEA, hasPermission, allowAuto, minThreshold } from "../util/employee";
 
 type EmployeeSettings = {
     _id: string;
@@ -56,12 +57,6 @@ type DecisionsJob = {
     decision?: ModelDecision; // ← optional
 };
 
-async function getActiveEA(tenantId: string): Promise<EmployeeSettings | null> {
-    const Employees = await col<EmployeeSettings>("Employee");
-    // choose the first enabled EA; adapt selection logic if you’ll support multiple EAs
-    return Employees.findOne({ tenantId, role: "ea", enabled: true });
-}
-
 function actionToPermissionKey(actionType: string):
     | keyof EmployeeSettings["permissions"]
     | null {
@@ -73,25 +68,6 @@ function actionToPermissionKey(actionType: string):
         default: return null;
     }
 }
-
-function getMinThreshold(emp: EmployeeSettings | null, actionType: "send_reply" | "send_calendar_reply" | "schedule_meeting", fallback: number) {
-    const t = emp?.auto?.thresholds;
-    return (t && typeof t[actionType] === "number" ? t[actionType]! : fallback);
-}
-
-function canAutoExecute(emp: EmployeeSettings | null, actionType: "send_reply" | "send_calendar_reply" | "schedule_meeting") {
-    const a = emp?.auto?.sendWithoutApproval;
-    if (!a) return false;
-    return !!a[actionType];
-}
-
-function hasPermission(emp: EmployeeSettings | null, actionType: string) {
-    if (!emp?.enabled) return false;
-    const key = actionToPermissionKey(actionType);
-    if (!key) return true; // if we don’t map it, don’t block
-    return !!emp.permissions?.[key];
-}
-
 
 export const eventsQueue = new Queue("events", { connection });
 export const decisionsQueue = new Queue("decisions", { connection });
@@ -162,60 +138,43 @@ export const eventsWorker = new Worker(
 export const decisionsWorker = new Worker(
     "decisions",
     async (job) => {
-        const { tenantId, threadId, decision } = job.data as DecisionsJob;
-
-        // Fetch minimal context for the draft
-        const threads = await col<MailThread>("MailThread");
-        const msgs    = await col<MailMessage>("MailMessage");
-
-        const thread = await threads.findOne({ _id: threadId, tenantId });
-        const last   = await msgs.find({ tenantId, threadId }).sort({ date: -1 }).limit(1).next();
-
-        // Make a *real* action for approvals
-        const action = {
-            type: "create_draft_reply" as const,
-            payload: {
-                threadId,
-                to: (thread?.participants ?? []).filter(e => e.includes("@")).slice(0, 1),
-                subject: thread?.subject?.startsWith("Re:") ? thread.subject : `Re: ${thread?.subject ?? ""}`,
-                body_md: `Hi,\n\nThanks for your email.\n\nBest,\nKadoo`,
-            },
+        const { tenantId, threadId, decision } = job.data as {
+            tenantId: string;
+            threadId: string;
+            decision?: { actionType: "send_reply" | "send_calendar_reply" | "schedule_meeting"; confidence?: number; payload?: any };
         };
 
-        // Load employee settings
+        // build your action (for send_reply, or map from decision?.payload if provided)
+        const action = decision?.actionType === "send_calendar_reply"
+            ? { type: "send_calendar_reply" as const, payload: decision?.payload }
+            : { type: "create_draft_reply" as const, payload: { threadId, to: [], subject: "", body_md: "Hi,\n\nThanks...", } };
+
         const emp = await getActiveEA(tenantId);
+        const actionType = (decision?.actionType ?? "send_reply") as "send_reply" | "send_calendar_reply" | "schedule_meeting";
+        const confidence = decision?.confidence ?? 0.9;
 
-        // Decide approval vs auto (example uses send_reply defaults)
-        const inferredType = (decision?.actionType ?? "send_reply") as
-            "send_reply" | "send_calendar_reply" | "schedule_meeting";
-        const confidence = decision?.confidence ?? 0.92;
+        const permOk = hasPermission(emp, actionType);
+        const canAuto = allowAuto(emp, actionType);
+        const thresh  = minThreshold(emp, actionType, actionType === "send_calendar_reply" ? 0.85 : 0.9);
 
-        const minThreshold = getMinThreshold(emp, inferredType, 0.9);
-        const allowAuto = canAutoExecute(emp, inferredType);
-        const permissionOk = hasPermission(emp, inferredType);
-
-        const eaOff = !emp || !emp.enabled;
-
-        const requiresApproval = eaOff || !(permissionOk && allowAuto && confidence >= minThreshold);
+        const requiresApproval = !emp?.enabled || !permOk || !canAuto || confidence < thresh;
 
         const logs = await col("DecisionLog");
         const { insertedId } = await logs.insertOne({
             tenantId,
-            employeeId: emp?._id ?? "ea-disabled",
+            employeeId: emp?._id ?? "ea-none",
             createdAt: new Date(),
             status: requiresApproval ? "pending" : "approved",
             requiresApproval,
             confidence,
-            reason: eaOff ? "ea_disabled_or_missing" : undefined,
             action,
         });
 
         if (!requiresApproval) {
-            // push directly to execute if auto
             await executeQueue.add(
                 action.type,
                 { tenantId, logId: insertedId.toString(), ...action.payload },
-                defaultOpts
+                { removeOnComplete: true, removeOnFail: 50 }
             );
         }
     },
@@ -586,7 +545,7 @@ export const executeWorker = new Worker(
                 };
 
                 const confidence: number | undefined = doc.confidence;
-                const min = getMinThreshold(emp, "schedule_meeting", 0.92);
+                const min = minThreshold(emp, "schedule_meeting", 0.92);
                 if (!checkThreshold(confidence, min)) {
                     await logs.updateOne(
                         { _id, tenantId },

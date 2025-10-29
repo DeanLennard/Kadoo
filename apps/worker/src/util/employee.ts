@@ -29,9 +29,24 @@ export type EmployeeSettings = {
 
 export async function getActiveEA(tenantId: string): Promise<EmployeeSettings | null> {
     const Employees = await col<EmployeeSettings>("Employee");
-    return Employees.findOne({ tenantId, role: "ea", enabled: true });
+    return Employees.findOne({ tenantId, role: "ea" });
 }
 
-export function canAcceptInvites(emp: EmployeeSettings | null) {
-    return !!(emp && emp.enabled && emp.permissions?.canAcceptInvites);
+export function hasPermission(emp: EmployeeSettings | null, action: "send_reply" | "send_calendar_reply" | "schedule_meeting" | "create_draft_reply") {
+    if (!emp?.enabled) return false;
+    switch (action) {
+        case "send_reply":         return !!emp.permissions?.canSendEmails;
+        case "create_draft_reply": return !!emp.permissions?.canSendEmails;
+        case "send_calendar_reply":return !!emp.permissions?.canAcceptInvites;
+        case "schedule_meeting":   return !!emp.permissions?.canScheduleMeetings;
+    }
+}
+
+export function allowAuto(emp: EmployeeSettings | null, action: "send_reply" | "send_calendar_reply" | "schedule_meeting") {
+    return !!emp?.enabled && !!emp?.auto?.sendWithoutApproval?.[action];
+}
+
+export function minThreshold(emp: EmployeeSettings | null, action: "send_reply" | "send_calendar_reply" | "schedule_meeting", fallback: number) {
+    const t = emp?.auto?.thresholds?.[action];
+    return typeof t === "number" ? t : fallback;
 }
