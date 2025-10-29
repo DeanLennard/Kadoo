@@ -17,6 +17,82 @@ import { buildCalendarReplyMime } from "../util/buildCalendarReplyMime";
 import { buildAcceptedEvent } from "../util/buildAcceptedEvent";
 import { spendCreditsAndLog } from "../util/credits";
 
+type EmployeeSettings = {
+    _id: string;
+    tenantId: string;
+    name: string;
+    email?: string;
+    role: "ea" | "agent" | "bot";
+    enabled: boolean;
+    permissions: {
+        canSendEmails: boolean;
+        canProposeTimes: boolean;
+        canAcceptInvites: boolean;
+        canDeclineInvites: boolean;
+        canScheduleMeetings: boolean;
+    };
+    auto?: {
+        sendWithoutApproval?: {
+            send_reply?: boolean;
+            send_calendar_reply?: boolean;
+            schedule_meeting?: boolean;
+        };
+        thresholds?: {
+            send_reply?: number;
+            send_calendar_reply?: number;
+            schedule_meeting?: number;
+        };
+    };
+};
+
+type ModelDecision =
+    | { actionType: "send_reply";          confidence?: number; payload?: any }
+    | { actionType: "send_calendar_reply"; confidence?: number; payload?: any }
+    | { actionType: "schedule_meeting";    confidence?: number; payload?: any };
+
+type DecisionsJob = {
+    tenantId: string;
+    threadId: string;
+    decision?: ModelDecision; // ← optional
+};
+
+async function getActiveEA(tenantId: string): Promise<EmployeeSettings | null> {
+    const Employees = await col<EmployeeSettings>("Employee");
+    // choose the first enabled EA; adapt selection logic if you’ll support multiple EAs
+    return Employees.findOne({ tenantId, role: "ea", enabled: true });
+}
+
+function actionToPermissionKey(actionType: string):
+    | keyof EmployeeSettings["permissions"]
+    | null {
+    switch (actionType) {
+        case "send_reply":            return "canSendEmails";
+        case "send_calendar_reply":   return "canAcceptInvites";     // accept/decline
+        case "schedule_meeting":      return "canScheduleMeetings";
+        case "create_draft_reply":    return "canSendEmails";        // drafting is still “send emails”
+        default: return null;
+    }
+}
+
+function getMinThreshold(emp: EmployeeSettings | null, actionType: "send_reply" | "send_calendar_reply" | "schedule_meeting", fallback: number) {
+    const t = emp?.auto?.thresholds;
+    return (t && typeof t[actionType] === "number" ? t[actionType]! : fallback);
+}
+
+function canAutoExecute(emp: EmployeeSettings | null, actionType: "send_reply" | "send_calendar_reply" | "schedule_meeting") {
+    const a = emp?.auto?.sendWithoutApproval;
+    if (!a) return false;
+    return !!a[actionType];
+}
+
+function hasPermission(emp: EmployeeSettings | null, actionType: string) {
+    if (!emp?.enabled) return false;
+    const key = actionToPermissionKey(actionType);
+    if (!key) return true; // if we don’t map it, don’t block
+    return !!emp.permissions?.[key];
+}
+
+
 export const eventsQueue = new Queue("events", { connection });
 export const decisionsQueue = new Queue("decisions", { connection });
 export const executeQueue = new Queue("execute", { connection });
@@ -70,7 +146,11 @@ export const eventsWorker = new Worker(
         await emit(tenantId, { kind: "queued", queue: "events", id: job.id, data: rest });
 
         // Echo to decisions as a demo
-        await decisionsQueue.add("plan", { tenantId, fromEvent: rest }, defaultOpts);
+        await decisionsQueue.add("plan", {
+            tenantId,
+            threadId: rest.threadId,
+            decision: rest.decision ?? undefined
+        }, defaultOpts);
     },
     { connection }
 );
@@ -82,7 +162,7 @@ export const eventsWorker = new Worker(
 export const decisionsWorker = new Worker(
     "decisions",
     async (job) => {
-        const { tenantId, threadId } = job.data as { tenantId: string; threadId: string };
+        const { tenantId, threadId, decision } = job.data as DecisionsJob;
 
         // Fetch minimal context for the draft
         const threads = await col<MailThread>("MailThread");
@@ -102,25 +182,39 @@ export const decisionsWorker = new Worker(
             },
         };
 
-        // Confidence is just a demo
-        const needsApproval = true;
-        if (needsApproval) {
-            const logs = await col("DecisionLog");
-            const { insertedId } = await logs.insertOne({
-                tenantId,
-                employeeId: "ea-1",
-                createdAt: new Date(),
-                status: "pending",
-                requiresApproval: true,
-                confidence: 0.92,
-                action,
-            });
-            console.log("[approvals] queued pending id:", insertedId.toString());
-            return;
-        }
+        // Load employee settings
+        const emp = await getActiveEA(tenantId);
 
-        // else enqueue execute directly…
-        await executeQueue.add("create_draft_reply", action.payload, { removeOnComplete: true });
+        // Decide approval vs auto (example uses send_reply defaults)
+        const inferredType = (decision?.actionType ?? "send_reply") as
+            "send_reply" | "send_calendar_reply" | "schedule_meeting";
+        const confidence = decision?.confidence ?? 0.92;
+
+        const minThreshold = getMinThreshold(emp, inferredType, 0.9);
+        const allowAuto = canAutoExecute(emp, inferredType);
+        const permissionOk = hasPermission(emp, inferredType);
+
+        const requiresApproval = !(permissionOk && allowAuto && confidence >= minThreshold);
+
+        const logs = await col("DecisionLog");
+        const { insertedId } = await logs.insertOne({
+            tenantId,
+            employeeId: emp?._id ?? "ea-default",
+            createdAt: new Date(),
+            status: requiresApproval ? "pending" : "approved",
+            requiresApproval,
+            confidence,
+            action,
+        });
+
+        if (!requiresApproval) {
+            // push directly to execute if auto
+            await executeQueue.add(
+                action.type,
+                { tenantId, logId: insertedId.toString(), ...action.payload },
+                defaultOpts
+            );
+        }
     },
     { connection }
 );
@@ -153,11 +247,29 @@ export const executeWorker = new Worker(
 
         console.log("[execute] action.type", doc.action?.type);
 
+        const emp = await getActiveEA(tenantId);
+
+        function guardOrDeny(actionType: "send_reply" | "send_calendar_reply" | "schedule_meeting" | "create_draft_reply") {
+            if (!hasPermission(emp, actionType)) {
+                return { ok: false, reason: "permission_denied" as const };
+            }
+            return { ok: true as const };
+        }
+
         switch (doc.action.type) {
             case "create_draft_reply": {
                 const { tenantId, threadId, to, subject, body_md } = job.data as {
                     tenantId: string; threadId: string; to: string[]; subject?: string; body_md: string;
                 };
+
+                const g = guardOrDeny("create_draft_reply");
+                if (!g.ok) {
+                    await logs.updateOne(
+                        { _id, tenantId },
+                        { $set: { status: "denied", deniedReason: g.reason, updatedAt: new Date() } }
+                    );
+                    return;
+                }
 
                 // Get the connector for this tenant (MVP: single connector)
                 const connectors = await col<MailboxConnector>("MailboxConnector");
@@ -170,7 +282,6 @@ export const executeWorker = new Worker(
                 await appendDraft(conn, raw);
 
                 // mark log executed if present
-                const logs = await col("DecisionLog");
                 await logs.updateOne(
                     { tenantId, "action.payload.threadId": threadId, status: { $in: ["pending", "approved"] } },
                     { $set: { status: "executed", executedAt: new Date(), result: { ok: true, kind: "draft" } } },
@@ -181,6 +292,15 @@ export const executeWorker = new Worker(
 
             case "send_reply": {
                 const { tenantId, threadId, to, subject, body_md, body_html } = job.data as any;
+
+                const g = guardOrDeny("send_reply");
+                if (!g.ok) {
+                    await logs.updateOne(
+                        { _id, tenantId },
+                        { $set: { status: "denied", deniedReason: g.reason, updatedAt: new Date() } }
+                    );
+                    return;
+                }
 
                 const connectors = await col<MailboxConnector>("MailboxConnector");
                 const conn = await connectors.findOne({ tenantId, type: "imap" });
@@ -273,6 +393,15 @@ export const executeWorker = new Worker(
 
             case "send_calendar_reply": {
                 const { tenantId, threadId, to, subject, body_md, body_html, ics_uid, ics_summary, ics_organizer, attendee_email, attendee_name, start, end, location } = job.data as any;
+
+                const g = guardOrDeny("send_calendar_reply");
+                if (!g.ok) {
+                    await logs.updateOne(
+                        { _id, tenantId },
+                        { $set: { status: "denied", deniedReason: g.reason, updatedAt: new Date() } }
+                    );
+                    return;
+                }
 
                 // load connector (same as other cases)
                 const connectors = await col<MailboxConnector>("MailboxConnector");
@@ -394,6 +523,15 @@ export const executeWorker = new Worker(
             }
 
             case "schedule_meeting": {
+                const g = guardOrDeny("schedule_meeting");
+                if (!g.ok) {
+                    await logs.updateOne(
+                        { _id, tenantId },
+                        { $set: { status: "denied", deniedReason: g.reason, updatedAt: new Date() } }
+                    );
+                    return;
+                }
+
                 // Pull the action payload from the decision log
                 // Expecting: { attendeeEmail, durationMin, windowISO: string[], conference? }
                 const a = (doc.action.payload ?? doc.action) as {
@@ -403,16 +541,9 @@ export const executeWorker = new Worker(
                     conference?: "meet" | "teams" | "zoom" | "jitsi";
                 };
 
-                // Confidence (from your pending log)
                 const confidence: number | undefined = doc.confidence;
-
-                // Load an EA employee for thresholds (or default 0.75)
-                const employeesCol = await col("Employee");
-                const employee =
-                    (await employeesCol.findOne({ tenantId, role: "ea" })) ??
-                    ({ thresholds: { schedule: 0.75 } } as any);
-
-                if (!checkThreshold(confidence, employee.thresholds?.schedule ?? 0.75)) {
+                const min = getMinThreshold(emp, "schedule_meeting", 0.92);
+                if (!checkThreshold(confidence, min)) {
                     await logs.updateOne(
                         { _id, tenantId },
                         { $set: { status: "denied", deniedReason: "threshold", updatedAt: new Date() } }
