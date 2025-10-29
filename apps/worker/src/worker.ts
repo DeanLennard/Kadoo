@@ -74,6 +74,22 @@ subscribe<IngestJob>(TOPIC_INGEST, async ({ tenantId, threadId, uid }) => {
     let msg = await messages.findOne({ tenantId, threadId, uid });
     if (!msg) return;
 
+    const ea = await getActiveEA(tenantId); // util returns EA even if disabled
+    if (!ea?.enabled) {
+        console.log("[worker] EA disabled (or missing) — skipping ingest for message", { threadId, uid });
+
+        // IMPORTANT: clear the lock you just set, otherwise it holds until TTL
+        await messages.updateOne(
+            { tenantId, threadId, uid },
+            { $unset: { processingLock: "" } }
+        );
+
+        // Optionally notify the UI:
+        // await emit(tenantId, { kind: "ingest_skipped", reason: "ea_disabled", threadId, uid });
+
+        return; // 👉 nothing else runs
+    }
+
     console.log(`[worker] ensureFullBody.start`, { threadId, uid });
     msg = await ensureFullBody({ tenantId, threadId, uid }) || msg;
     console.log(`[worker] ensureFullBody.done`, { hasText: !!msg?.text, hasHtml: !!msg?.html });
