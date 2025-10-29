@@ -18,57 +18,6 @@ import { buildAcceptedEvent } from "../util/buildAcceptedEvent";
 import { spendCreditsAndLog } from "../util/credits";
 import { getActiveEA, hasPermission, allowAuto, minThreshold } from "../util/employee";
 
-type EmployeeSettings = {
-    _id: string;
-    tenantId: string;
-    name: string;
-    email?: string;
-    role: "ea" | "agent" | "bot";
-    enabled: boolean;
-    permissions: {
-        canSendEmails: boolean;
-        canProposeTimes: boolean;
-        canAcceptInvites: boolean;
-        canDeclineInvites: boolean;
-        canScheduleMeetings: boolean;
-    };
-    auto?: {
-        sendWithoutApproval?: {
-            send_reply?: boolean;
-            send_calendar_reply?: boolean;
-            schedule_meeting?: boolean;
-        };
-        thresholds?: {
-            send_reply?: number;
-            send_calendar_reply?: number;
-            schedule_meeting?: number;
-        };
-    };
-};
-
-type ModelDecision =
-    | { actionType: "send_reply";          confidence?: number; payload?: any }
-    | { actionType: "send_calendar_reply"; confidence?: number; payload?: any }
-    | { actionType: "schedule_meeting";    confidence?: number; payload?: any };
-
-type DecisionsJob = {
-    tenantId: string;
-    threadId: string;
-    decision?: ModelDecision; // ← optional
-};
-
-function actionToPermissionKey(actionType: string):
-    | keyof EmployeeSettings["permissions"]
-    | null {
-    switch (actionType) {
-        case "send_reply":            return "canSendEmails";
-        case "send_calendar_reply":   return "canAcceptInvites";     // accept/decline
-        case "schedule_meeting":      return "canScheduleMeetings";
-        case "create_draft_reply":    return "canSendEmails";        // drafting is still “send emails”
-        default: return null;
-    }
-}
-
 export const eventsQueue = new Queue("events", { connection });
 export const decisionsQueue = new Queue("decisions", { connection });
 export const executeQueue = new Queue("execute", { connection });
@@ -214,14 +163,9 @@ export const executeWorker = new Worker(
         function guardOrDeny(
             actionType: "send_reply" | "send_calendar_reply" | "schedule_meeting" | "create_draft_reply"
         ) {
-            if (!emp) {
-                return { ok: false as const, reason: "ea_missing" as const };
-            }
-            if (!emp.enabled) {
-                return { ok: false as const, reason: "ea_disabled" as const };
-            }
-            const key = actionToPermissionKey(actionType);
-            if (key && !emp.permissions?.[key]) {
+            if (!emp)        return { ok: false as const, reason: "ea_missing" as const };
+            if (!emp.enabled) return { ok: false as const, reason: "ea_disabled" as const };
+            if (!hasPermission(emp, actionType)) {
                 return { ok: false as const, reason: "permission_denied" as const };
             }
             return { ok: true as const };
