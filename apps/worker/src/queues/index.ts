@@ -93,10 +93,16 @@ export const decisionsWorker = new Worker(
             decision?: { actionType: "send_reply" | "send_calendar_reply" | "schedule_meeting"; confidence?: number; payload?: any };
         };
 
-        // build your action (for send_reply, or map from decision?.payload if provided)
-        const action = decision?.actionType === "send_calendar_reply"
-            ? { type: "send_calendar_reply" as const, payload: decision?.payload }
-            : { type: "create_draft_reply" as const, payload: { threadId, to: [], subject: "", body_md: "Hi,\n\nThanks...", } };
+        // Load context we may need to fill gaps
+        const threads = await col<MailThread>("MailThread");
+        const thread = await threads.findOne({ _id: threadId, tenantId });
+        const inferredTo =
+            (thread?.participants ?? []).filter(e => typeof e === "string" && e.includes("@")).slice(0, 1);
+
+        const replySubject =
+            thread?.subject?.toLowerCase().startsWith("re:")
+                ? (thread?.subject ?? "")
+                : `Re: ${thread?.subject ?? ""}`;
 
         const emp = await getActiveEA(tenantId);
         const actionType = (decision?.actionType ?? "send_reply") as "send_reply" | "send_calendar_reply" | "schedule_meeting";
@@ -104,10 +110,63 @@ export const decisionsWorker = new Worker(
 
         const permOk = hasPermission(emp, actionType);
         const canAuto = allowAuto(emp, actionType);
-        const thresh  = minThreshold(emp, actionType, actionType === "send_calendar_reply" ? 0.85 : 0.9);
+        const thresh  = minThreshold(emp, actionType, actionType === "send_calendar_reply" ? 0.85 : 0.90);
 
+        // If EA missing/disabled or lacking permission, or auto not allowed, or below threshold → require approval
         const requiresApproval = !emp?.enabled || !permOk || !canAuto || confidence < thresh;
 
+        // Normalise payload fields from decision + thread fallbacks
+        const p = decision?.payload ?? {};
+        const payload = {
+            // common
+            threadId,
+            to: (Array.isArray(p.to) && p.to.length ? p.to : inferredTo) ?? [],
+            subject: (typeof p.subject === "string" && p.subject.length ? p.subject : replySubject),
+            body_md: p.body_md ?? p.text ?? "Thanks for your email.",
+            body_html: p.body_html, // optional
+            // calendar-only (kept if present; harmless for send_reply)
+            ics_uid: p.ics_uid,
+            ics_summary: p.ics_summary,
+            ics_organizer: p.ics_organizer,
+            attendee_email: p.attendee_email,
+            attendee_name: p.attendee_name,
+            start: p.start,
+            end: p.end,
+            location: p.location,
+            // scheduling-only fields pass-through
+            windowISO: p.windowISO,
+            durationMin: p.durationMin,
+            conference: p.conference,
+            attendeeEmail: p.attendeeEmail,
+        };
+
+        // Build action depending on auto/approval
+        let action:
+            | { type: "create_draft_reply"; payload: any }
+            | { type: "send_reply"; payload: any }
+            | { type: "send_calendar_reply"; payload: any }
+            | { type: "schedule_meeting"; payload: any };
+
+        if (requiresApproval) {
+            // Always create a draft for approval path (even for calendar & schedule)
+            action = { type: "create_draft_reply", payload };
+        } else {
+            // Auto path → execute the user-intended action
+            switch (actionType) {
+                case "send_calendar_reply":
+                    action = { type: "send_calendar_reply", payload };
+                    break;
+                case "schedule_meeting":
+                    action = { type: "schedule_meeting", payload };
+                    break;
+                case "send_reply":
+                default:
+                    action = { type: "send_reply", payload };
+                    break;
+            }
+        }
+
+        // Persist decision log
         const logs = await col("DecisionLog");
         const { insertedId } = await logs.insertOne({
             tenantId,
@@ -119,6 +178,7 @@ export const decisionsWorker = new Worker(
             action,
         });
 
+        // Auto-execute only when approved
         if (!requiresApproval) {
             await executeQueue.add(
                 action.type,

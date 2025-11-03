@@ -4,6 +4,7 @@ import { connection } from "./redis";
 import "./queues";
 import { startRunners } from "./runners";
 import "./worker";
+import "./workers/rescan";
 
 async function main() {
     console.log("Worker starting…");

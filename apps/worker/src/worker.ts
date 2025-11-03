@@ -10,6 +10,7 @@ import { resolveSpamMailbox } from "./util/resolveSpamMailbox";
 import { handleInvite } from "./workers/handleInvite";
 import {decisionsQueue} from "./queues";
 import { getActiveEA, hasPermission } from "./util/employee";
+import { generateDraft } from "./workers/generateDraft";
 
 type DraftDecision = {
     kind: "draft";
@@ -76,12 +77,14 @@ subscribe<IngestJob>(TOPIC_INGEST, async ({ tenantId, threadId, uid }) => {
 
     const ea = await getActiveEA(tenantId); // util returns EA even if disabled
     if (!ea?.enabled) {
-        console.log("[worker] EA disabled (or missing) — skipping ingest for message", { threadId, uid });
+        console.log("[worker] EA disabled — deferring ingest", { threadId, uid });
 
-        // IMPORTANT: clear the lock you just set, otherwise it holds until TTL
         await messages.updateOne(
             { tenantId, threadId, uid },
-            { $unset: { processingLock: "" } }
+            {
+                $set:  { ingestDeferred: true, ingestDeferredAt: new Date() },
+                $unset:{ processingLock: "" },
+            }
         );
 
         // Optionally notify the UI:
@@ -245,23 +248,33 @@ subscribe<IngestJob>(TOPIC_INGEST, async ({ tenantId, threadId, uid }) => {
             return;
         }
 
-        // 2) EA enabled but cannot send → create PENDING approval decision (no IMAP append)
+        // 2) Generate the draft content (LLM) up front
+        const draft = await generateDraft({
+            tenantId,
+            threadId,
+            uidRef: uid,
+            msg: { ...msg, ...facts },
+            subject: threadSubject,
+            settings,
+        });
+
+        // 3) EA enabled but cannot send → create PENDING approval decision (no IMAP append)
         if (!hasPermission(ea, "send_reply")) {
             await (await col("DecisionLog")).insertOne({
                 tenantId,
                 createdAt: new Date(),
                 status: "pending",
                 requiresApproval: true,
-                confidence: decision.confidence ?? 0.9,
+                confidence: draft.confidence ?? 0.9,
                 reason: "permission_denied",
                 action: {
                     type: "create_draft_reply",
                     payload: {
                         threadId,
                         to: [msg.from].filter(Boolean),
-                        subject: decision.subject ?? threadSubject,
-                        body_md: decision.text ?? "Thanks for your message.",
-                        body_html: decision.html,
+                        subject: draft.subject ?? threadSubject,
+                        body_md: draft.text ?? "Thanks for your message.",
+                        body_html: draft.html,
                     },
                 },
                 context: { labels: facts.labels, priority: facts.priority },
@@ -269,7 +282,7 @@ subscribe<IngestJob>(TOPIC_INGEST, async ({ tenantId, threadId, uid }) => {
             return;
         }
 
-        // 3) EA enabled + permission OK → push to decisions (it will auto-exec or remain pending)
+        // 4) EA enabled + permission OK → push to decisions (auto or pending decided there)
         await decisionsQueue.add(
             "plan",
             {
@@ -277,12 +290,12 @@ subscribe<IngestJob>(TOPIC_INGEST, async ({ tenantId, threadId, uid }) => {
                 threadId,
                 decision: {
                     actionType: "send_reply",
-                    confidence: decision.confidence ?? 0.9,
+                    confidence: draft.confidence ?? 0.9,
                     payload: {
                         to: [msg.from].filter(Boolean),
-                        subject: decision.subject ?? threadSubject,
-                        body_md: decision.text ?? "Thanks for your message.",
-                        body_html: decision.html,
+                        subject: draft.subject ?? threadSubject,
+                        body_md: draft.text ?? "Thanks for your message.",
+                        body_html: draft.html,
                     },
                 },
             },
@@ -291,7 +304,6 @@ subscribe<IngestJob>(TOPIC_INGEST, async ({ tenantId, threadId, uid }) => {
 
         return;
     }
-
 
     // if decision.kind === 'none' do nothing
 });

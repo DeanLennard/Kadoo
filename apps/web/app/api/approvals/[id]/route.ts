@@ -45,13 +45,16 @@ export const POST = withApiAuth(async (req, { tenantId, session }) => {
         return NextResponse.json({ ok: true });
     }
 
-    // approve → mark approved + enqueue execution
-    await logs.updateOne(filter, { $set: { status: "approved", approvedAt: new Date() } });
+    const execType =
+        doc.action?.type === "create_draft_reply" ? "send_reply" : (doc.action?.type || "do");
+
     await executeQueue.add(
-        doc.action.type || "do",
-        { ...doc.action.payload, logId: _id.toString(), tenantId },
+        execType,
+        { ...doc.action.payload, logId: _id.toString(), tenantId, approved: true },
         { removeOnComplete: true, jobId: `exec:${tenantId}:${_id.toString()}` }
     );
+
+    await logs.updateOne(filter, { $set: { status: "approved", approvedAt: new Date() } });
 
     return NextResponse.json({ ok: true });
 }, ["owner", "admin", "reviewer"]);

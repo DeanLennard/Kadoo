@@ -36,6 +36,7 @@ export default function RootLayout({
                             <a className="mr-4 hover:underline" href="/inbox">Inbox</a>
                             <a className="mr-4 hover:underline" href="/calendar">Calendar</a>
                             <a className="hover:underline" href="/approvals">Approvals</a>
+                            <a className="hover:underline" href="/employees">Employees</a>
                         </nav>
                     </div>
                 </header>

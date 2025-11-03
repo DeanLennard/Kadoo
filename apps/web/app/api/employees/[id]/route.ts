@@ -3,6 +3,10 @@ import { NextResponse } from "next/server";
 import { withApiAuth } from "@/lib/api-auth";
 import { col } from "@/lib/db";
 import { ObjectId } from "mongodb";
+import { Queue } from "bullmq";
+import { bullConnection as connection } from "@/lib/redis";
+
+const maintenanceQueue = new Queue("maintenance", { connection });
 
 export const PATCH = withApiAuth(async (req, { tenantId, role }) => {
     if (!["owner", "admin"].includes(role)) {
@@ -10,7 +14,7 @@ export const PATCH = withApiAuth(async (req, { tenantId, role }) => {
     }
 
     const url = new URL(req.url);
-    const idParam = url.pathname.split("/").pop()!; // "690100f5ed361dcf9b4e56b1"
+    const idParam = url.pathname.split("/").pop()!;
     const body = await req.json();
 
     // Build $set
@@ -18,11 +22,11 @@ export const PATCH = withApiAuth(async (req, { tenantId, role }) => {
     if (typeof body.enabled === "boolean") set.enabled = body.enabled;
 
     if (body.permissions && typeof body.permissions === "object") {
-        set["permissions.canSendEmails"]        = !!body.permissions.canSendEmails;
-        set["permissions.canProposeTimes"]      = !!body.permissions.canProposeTimes;
-        set["permissions.canAcceptInvites"]     = !!body.permissions.canAcceptInvites;
-        set["permissions.canDeclineInvites"]    = !!body.permissions.canDeclineInvites;
-        set["permissions.canScheduleMeetings"]  = !!body.permissions.canScheduleMeetings;
+        set["permissions.canSendEmails"]       = !!body.permissions.canSendEmails;
+        set["permissions.canProposeTimes"]     = !!body.permissions.canProposeTimes;
+        set["permissions.canAcceptInvites"]    = !!body.permissions.canAcceptInvites;
+        set["permissions.canDeclineInvites"]   = !!body.permissions.canDeclineInvites;
+        set["permissions.canScheduleMeetings"] = !!body.permissions.canScheduleMeetings;
     }
 
     if (body.auto && typeof body.auto === "object") {
@@ -42,21 +46,34 @@ export const PATCH = withApiAuth(async (req, { tenantId, role }) => {
 
     const Employees = await col<any>("Employee");
 
-    // Build a query that matches either string _id or ObjectId _id
+    // ✅ define the `or` array
     const or: any[] = [{ _id: idParam }];
-    if (/^[a-f0-9]{24}$/i.test(idParam)) {
+    if (ObjectId.isValid(idParam)) {
         or.push({ _id: new ObjectId(idParam) });
     }
 
     const q = { tenantId, $or: or };
 
-    const res = await Employees.updateOne(q, { $set: set });
+    // Grab previous enabled state to detect flip
+    const prev = await Employees.findOne(q);
+    const res  = await Employees.updateOne(q, { $set: set });
+
     if (!res.matchedCount) {
-        // Helpful debug while you test
         console.warn("[employees.PATCH] not found for", q);
         return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
 
     const updated = await Employees.findOne(q);
+
+    // Only enqueue rescan if we flipped from disabled -> enabled
+    if (prev?.enabled === false && updated?.enabled === true) {
+        console.log("[employees.PATCH] EA re-enabled → enqueue rescan", { tenantId, employeeId: idParam });
+        await maintenanceQueue.add(
+            "rescan-tenant",
+            { tenantId },
+            { removeOnComplete: true, attempts: 2 }
+        );
+    }
+
     return NextResponse.json({ ok: true, item: updated });
 }, ["owner", "admin"]);
